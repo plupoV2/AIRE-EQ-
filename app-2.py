@@ -343,14 +343,20 @@ def db_delete(prop_id: str, email: str):
     except: pass
 
 def load_firm_data():
-    """Load saved deals from Supabase once per session."""
+    """Load saved deals from Supabase. Runs whenever db_loaded is False."""
     email = st.session_state.get("user_email")
-    if not email or st.session_state.get("db_loaded"):
+    if not email:
+        return
+    if st.session_state.get("db_loaded"):
         return
     props, err = db_load(email)
-    st.session_state.db_error = err  # surface error in UI if needed
+    st.session_state.db_error = err
     if props:
-        st.session_state.properties  = props
+        # Merge: keep any session-only deals not yet in DB, add DB deals
+        existing_ids = {p['id'] for p in props}
+        session_only = [p for p in st.session_state.get('properties', [])
+                        if p['id'] not in existing_ids]
+        st.session_state.properties  = props + session_only
         st.session_state.deal_data   = props[0]
         st.session_state.deal_loaded = True
     st.session_state.db_loaded = True
@@ -971,15 +977,18 @@ def view_pipeline():
         ltv            = c9.slider("LTV (%)", 40, 80, 65) / 100
         submitted = st.form_submit_button("Add Deal to Pipeline", type="primary", use_container_width=True)
         if submitted and deal_name:
-            debt = purchase_price * ltv
+            debt  = purchase_price * ltv
             lp_eq = purchase_price * (1 - ltv) * 0.90
             gp_eq = purchase_price * (1 - ltv) * 0.10
             cap_rate = noi_y1 / purchase_price if purchase_price else 0
-            est_irr = cap_rate + 0.04
-            est_em = 1.0 + est_irr * 5
-            s, g = score_deal(est_irr, est_em, 0.05)
+            est_irr  = cap_rate + 0.04
+            est_em   = 1.0 + est_irr * 5
+            s, g     = score_deal(est_irr, est_em, 0.05)
+            # Use timestamp in ID to guarantee uniqueness across sessions
+            import time as _time
+            prop_id = f"prop_{int(_time.time())}"
             new_prop = {
-                "id": f"prop_{len(st.session_state.properties)+1:03d}",
+                "id": prop_id,
                 "name": deal_name, "address": deal_address, "units": int(deal_units),
                 "vintage": int(deal_vintage), "type": deal_type, "status": deal_status,
                 "purchase_price": purchase_price, "debt_amount": debt,
@@ -990,18 +999,32 @@ def view_pipeline():
                 "ai_prediction": est_irr, "ai_correct": True,
                 "lat": 32.7767, "lon": -96.7970, "notes": ""
             }
-            st.session_state.properties.append(new_prop)
-            st.session_state.deal_data = new_prop
-            st.session_state.deal_loaded = True
-            # Persist to Supabase immediately
+            # Save to DB FIRST — before touching session state
             ok, err = db_save(new_prop, st.session_state.user_email)
-            if ok:
-                st.success(f"✅ '{deal_name}' saved permanently to your pipeline!")
-            else:
-                st.warning(f"⚠️ Deal added this session but DB save failed: {err}")
-                st.info("To fix: run create_table.sql in your Supabase SQL editor, then try again.")
+            # Now update session state
+            st.session_state.properties.append(new_prop)
+            st.session_state.deal_data   = new_prop
+            st.session_state.deal_loaded = True
+            # Reset db_loaded so next page load re-fetches from DB
+            st.session_state.db_loaded = False
+            # Store result to show AFTER rerun
+            st.session_state.last_save_ok  = ok
+            st.session_state.last_save_err = err
+            st.session_state.last_save_name = deal_name
             st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)
+
+    # Show save result from previous submit (persists through rerun)
+    if st.session_state.get("last_save_ok") is not None:
+        name = st.session_state.get("last_save_name", "Deal")
+        if st.session_state.last_save_ok:
+            st.success(f"✅ '{name}' saved to database successfully!")
+        else:
+            err = st.session_state.last_save_err
+            st.error(f"❌ Save failed for '{name}': {err}")
+            st.info("Make sure you ran create_table.sql in Supabase SQL Editor.")
+        # Clear after showing once
+        st.session_state.last_save_ok = None
 
 # ──────────────────────────────────────────────────────────────────────────────
 def view_data_room():
