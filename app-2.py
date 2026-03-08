@@ -214,19 +214,22 @@ def inject_css():
 # ──────────────────────────────────────────────────────────────────────────────
 # SECTION 2 │ CLIENTS & STATE
 # ──────────────────────────────────────────────────────────────────────────────
-@st.cache_resource
-def init_supabase():
-    url = st.secrets.get("SUPABASE_URL", "")
-    key = st.secrets.get("SUPABASE_KEY", "")
-    if not url or not key:
-        return None
-    return create_client(url, key)
+def get_supabase():
+    """Get a fresh Supabase client every call — never cache None."""
+    try:
+        url = st.secrets.get("SUPABASE_URL", "")
+        key = st.secrets.get("SUPABASE_KEY", "")
+        if not url or not key:
+            return None, "Missing SUPABASE_URL or SUPABASE_KEY in secrets"
+        return create_client(url, key), None
+    except Exception as e:
+        return None, str(e)
 
 @st.cache_resource
 def init_openai():
     return OpenAI(api_key=st.secrets.get("OPENAI_API_KEY", ""))
 
-supabase = init_supabase()
+# Keep ai_client as module-level, supabase now fetched fresh per call
 ai_client = init_openai()
 
 # No demo data — firms start with a clean slate
@@ -248,115 +251,107 @@ def init_state():
             st.session_state[k] = v
 
 # ──────────────────────────────────────────────────────────────────────────────
-# SECTION 2B │ SUPABASE PERSISTENCE
+# SECTION 2B │ SUPABASE PERSISTENCE (BULLETPROOF)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def get_firm_id_from_email(email: str) -> str:
-    """Derive a consistent firm key from login email domain."""
+def firm_key(email: str) -> str:
     if not email or '@' not in email:
         return "unknown"
-    return email.split('@')[1].replace('.', '_').replace('-', '_').lower()
+    return email.split('@')[1].replace('.','_').replace('-','_').lower()
 
-def save_property_to_db(prop: dict, user_email: str) -> tuple:
-    """Upsert a property to Supabase. Returns (success, error_message)."""
-    if not supabase:
-        return False, "Supabase not connected — check SUPABASE_URL and SUPABASE_KEY in secrets"
+def db_save(prop: dict, email: str) -> tuple:
+    sb, err = get_supabase()
+    if not sb:
+        return False, err or "No Supabase client"
     try:
-        firm_key = get_firm_id_from_email(user_email)
-        record = {
-            "firm_key":         firm_key,
-            "prop_id":          prop.get("id", ""),
-            "name":             prop.get("name", ""),
-            "address":          prop.get("address", ""),
-            "units":            int(prop.get("units", 0)),
-            "vintage":          int(prop.get("vintage", 0)),
-            "property_type":    prop.get("type", "Multifamily"),
-            "status":           prop.get("status", "active"),
-            "purchase_price":   float(prop.get("purchase_price", 0)),
-            "debt_amount":      float(prop.get("debt_amount", 0)),
-            "lp_equity":        float(prop.get("lp_equity", 0)),
-            "gp_equity":        float(prop.get("gp_equity", 0)),
-            "noi_year1":        float(prop.get("noi_year1", 0)),
-            "irr":              float(prop.get("irr", 0)),
-            "equity_mult":      float(prop.get("equity_mult", 0)),
-            "gp_irr":           float(prop.get("gp_irr", 0)),
-            "loss_prob":        float(prop.get("loss_prob", 0)),
-            "grade":            prop.get("grade", "B"),
-            "score":            int(prop.get("score", 50)),
-            "acquisition_date": str(prop.get("acquisition_date", "")),
-            "notes":            prop.get("notes", ""),
-            "ai_prediction":    float(prop.get("ai_prediction", 0)),
-            "ai_correct":       bool(prop.get("ai_correct", True)),
-            "lat":              float(prop.get("lat", 0)),
-            "lon":              float(prop.get("lon", 0)),
+        rec = {
+            "firm_key":         firm_key(email),
+            "prop_id":          str(prop.get("id","")),
+            "name":             str(prop.get("name","")),
+            "address":          str(prop.get("address","")),
+            "units":            int(prop.get("units",0)),
+            "vintage":          int(prop.get("vintage",0)),
+            "property_type":    str(prop.get("type","Multifamily")),
+            "status":           str(prop.get("status","active")),
+            "purchase_price":   float(prop.get("purchase_price",0)),
+            "debt_amount":      float(prop.get("debt_amount",0)),
+            "lp_equity":        float(prop.get("lp_equity",0)),
+            "gp_equity":        float(prop.get("gp_equity",0)),
+            "noi_year1":        float(prop.get("noi_year1",0)),
+            "irr":              float(prop.get("irr",0)),
+            "equity_mult":      float(prop.get("equity_mult",0)),
+            "gp_irr":           float(prop.get("gp_irr",0)),
+            "loss_prob":        float(prop.get("loss_prob",0)),
+            "grade":            str(prop.get("grade","B")),
+            "score":            int(prop.get("score",50)),
+            "acquisition_date": str(prop.get("acquisition_date","")),
+            "notes":            str(prop.get("notes","")),
+            "ai_prediction":    float(prop.get("ai_prediction",0)),
+            "ai_correct":       bool(prop.get("ai_correct",True)),
+            "lat":              float(prop.get("lat",0)),
+            "lon":              float(prop.get("lon",0)),
         }
-        resp = supabase.table("aire_properties").upsert(record, on_conflict="firm_key,prop_id").execute()
+        sb.table("aire_properties").upsert(rec, on_conflict="firm_key,prop_id").execute()
         return True, None
     except Exception as e:
         return False, str(e)
 
-def load_properties_from_db(user_email: str) -> list:
-    """Load all properties for this firm from Supabase."""
-    if not supabase:
-        return []
+def db_load(email: str) -> tuple:
+    sb, err = get_supabase()
+    if not sb:
+        return [], err or "No Supabase client"
     try:
-        firm_key = get_firm_id_from_email(user_email)
-        resp = supabase.table("aire_properties").select("*").eq("firm_key", firm_key).execute()
+        fk   = firm_key(email)
+        resp = sb.table("aire_properties").select("*").eq("firm_key", fk).order("id").execute()
         props = []
         for r in resp.data:
             props.append({
-                "id":             r.get("prop_id", ""),
-                "name":           r.get("name", ""),
-                "address":        r.get("address", ""),
-                "units":          r.get("units", 0),
-                "vintage":        r.get("vintage", 0),
-                "type":           r.get("property_type", "Multifamily"),
-                "status":         r.get("status", "active"),
-                "purchase_price": r.get("purchase_price", 0),
-                "debt_amount":    r.get("debt_amount", 0),
-                "lp_equity":      r.get("lp_equity", 0),
-                "gp_equity":      r.get("gp_equity", 0),
-                "noi_year1":      r.get("noi_year1", 0),
-                "irr":            r.get("irr", 0),
-                "equity_mult":    r.get("equity_mult", 0),
-                "gp_irr":         r.get("gp_irr", 0),
-                "loss_prob":      r.get("loss_prob", 0),
-                "grade":          r.get("grade", "B"),
-                "score":          r.get("score", 50),
-                "acquisition_date": r.get("acquisition_date", ""),
-                "notes":          r.get("notes", ""),
-                "ai_prediction":  r.get("ai_prediction", 0),
-                "ai_correct":     r.get("ai_correct", True),
-                "lat":            r.get("lat", 32.7767),
-                "lon":            r.get("lon", -96.7970),
+                "id":             r.get("prop_id",""),
+                "name":           r.get("name",""),
+                "address":        r.get("address",""),
+                "units":          r.get("units",0),
+                "vintage":        r.get("vintage",0),
+                "type":           r.get("property_type","Multifamily"),
+                "status":         r.get("status","active"),
+                "purchase_price": r.get("purchase_price",0),
+                "debt_amount":    r.get("debt_amount",0),
+                "lp_equity":      r.get("lp_equity",0),
+                "gp_equity":      r.get("gp_equity",0),
+                "noi_year1":      r.get("noi_year1",0),
+                "irr":            r.get("irr",0),
+                "equity_mult":    r.get("equity_mult",0),
+                "gp_irr":         r.get("gp_irr",0),
+                "loss_prob":      r.get("loss_prob",0),
+                "grade":          r.get("grade","B"),
+                "score":          r.get("score",50),
+                "acquisition_date": r.get("acquisition_date",""),
+                "notes":          r.get("notes",""),
+                "ai_prediction":  r.get("ai_prediction",0),
+                "ai_correct":     r.get("ai_correct",True),
+                "lat":            r.get("lat",32.7767),
+                "lon":            r.get("lon",-96.7970),
             })
-        return props
+        return props, None
     except Exception as e:
-        return []
+        return [], str(e)
 
-def delete_property_from_db(prop_id: str, user_email: str):
-    """Delete a property from Supabase."""
-    if not supabase:
-        return
+def db_delete(prop_id: str, email: str):
+    sb, _ = get_supabase()
+    if not sb: return
     try:
-        firm_key = get_firm_id_from_email(user_email)
-        supabase.table("aire_properties").delete().eq("firm_key", firm_key).eq("prop_id", prop_id).execute()
-    except:
-        pass
+        sb.table("aire_properties").delete().eq("firm_key", firm_key(email)).eq("prop_id", prop_id).execute()
+    except: pass
 
 def load_firm_data():
-    """Load this firm's deals from Supabase once per session login."""
-    # Reset db_loaded when user changes
+    """Load saved deals from Supabase once per session."""
     email = st.session_state.get("user_email")
-    if not email:
+    if not email or st.session_state.get("db_loaded"):
         return
-    # Only load once per session (flag resets on logout via session_state.clear())
-    if st.session_state.get("db_loaded"):
-        return
-    saved = load_properties_from_db(email)
-    if saved:
-        st.session_state.properties  = saved
-        st.session_state.deal_data   = saved[0]
+    props, err = db_load(email)
+    st.session_state.db_error = err  # surface error in UI if needed
+    if props:
+        st.session_state.properties  = props
+        st.session_state.deal_data   = props[0]
         st.session_state.deal_loaded = True
     st.session_state.db_loaded = True
 
@@ -863,6 +858,16 @@ def view_pipeline():
     
     props = st.session_state.properties
 
+    # ── DB Status Banner ──
+    db_err = st.session_state.get("db_error")
+    sb_test, sb_err = get_supabase()
+    if sb_err:
+        st.error(f"⚠️ **Database not connected:** {sb_err}  \n Deals will exist this session only. Fix your Supabase secrets to enable saving.")
+    elif db_err:
+        st.warning(f"⚠️ **DB load issue:** {db_err}")
+    else:
+        st.success("🔒 Connected to database — deals save automatically", icon="✅")
+
     # Empty state
     if not props:
         st.markdown("""
@@ -927,7 +932,7 @@ def view_pipeline():
             with col_del:
                 if st.button("🗑 Remove", key=f"del_{p['id']}", help="Remove this deal"):
                     st.session_state.properties = [x for x in st.session_state.properties if x['id'] != p['id']]
-                    delete_property_from_db(p['id'], st.session_state.user_email)
+                    db_delete(p['id'], st.session_state.user_email)
                     if st.session_state.deal_data and st.session_state.deal_data.get('id') == p['id']:
                         remaining = st.session_state.properties
                         st.session_state.deal_data = remaining[0] if remaining else None
@@ -985,7 +990,7 @@ def view_pipeline():
             st.session_state.deal_data = new_prop
             st.session_state.deal_loaded = True
             # Persist to Supabase immediately
-            ok, err = save_property_to_db(new_prop, st.session_state.user_email)
+            ok, err = db_save(new_prop, st.session_state.user_email)
             if ok:
                 st.success(f"✅ '{deal_name}' saved permanently to your pipeline!")
             else:
@@ -1381,5 +1386,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
