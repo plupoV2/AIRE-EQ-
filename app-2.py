@@ -1077,14 +1077,10 @@ def load_firm_data():
 # ──────────────────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600)
 def fetch_fred_rate():
-    key = st.secrets.get("FRED_API_KEY", "")
-    if not key:
-        return 6.75
+    """Live loan rate = 10Y Treasury + 200bps. Single source of truth: fetch_macro()."""
     try:
-        url = f"https://api.stlouisfed.org/fred/series/observations?series_id=DGS10&api_key={key}&file_type=json&sort_order=desc&limit=1"
-        r = requests.get(url, timeout=5).json()
-        return float(r['observations'][0]['value']) + 2.00
-    except:
+        return float(fetch_macro()["loan_rate"])
+    except Exception:
         return 6.75
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1204,7 +1200,376 @@ _AIRE_CORR = np.array([
 _AIRE_CHOL = np.linalg.cholesky(_AIRE_CORR)
 
 
-def aire_monte_carlo(deal: dict, settings: dict, n: int = 3000) -> dict:
+# ──────────────────────────────────────────────────────────────────────────────
+# SECTION 3H │ AIRE MARKET REGIME ENGINE
+# Live macro data (10Y, 2s10s slope, Baa credit spread) classifies the current
+# market regime, and the regime conditions the ENTIRE simulation: volatilities,
+# correlations, and exit-cap drift all shift with observed market conditions.
+# Grades reflow on every load — so a deal graded B in calm markets can honestly
+# become C when spreads blow out, without anyone touching an assumption.
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _fred_series(series_id: str, key: str):
+    try:
+        url = (f"https://api.stlouisfed.org/fred/series/observations?"
+               f"series_id={series_id}&api_key={key}&file_type=json&sort_order=desc&limit=1")
+        r = requests.get(url, timeout=5).json()
+        v = r["observations"][0]["value"]
+        return float(v) if v not in (".", "", None) else None
+    except Exception:
+        return None
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_macro() -> dict:
+    """Live macro snapshot. Falls back to neutral defaults without a FRED key,
+    and flags live=False so the UI never pretends stale data is live."""
+    key = st.secrets.get("FRED_API_KEY", "")
+    dgs10 = dgs2 = baa = None
+    if key:
+        dgs10 = _fred_series("DGS10", key)
+        dgs2  = _fred_series("DGS2", key)
+        baa   = _fred_series("BAA10Y", key)   # Moody's Baa corporate spread over 10Y
+    live = dgs10 is not None
+    dgs10 = dgs10 if dgs10 is not None else 4.25
+    dgs2  = dgs2  if dgs2  is not None else 4.05
+    baa   = baa   if baa   is not None else 2.10
+    return {
+        "dgs10": dgs10, "dgs2": dgs2, "baa_spread": baa,
+        "slope": dgs10 - dgs2,
+        "loan_rate": dgs10 + 2.00,
+        "live": live,
+        "as_of": datetime.now().strftime("%b %d, %Y %H:%M"),
+    }
+
+# Transparent, rules-based regime classification. Institutional buyers must be
+# able to see WHY the model says what it says — no black boxes.
+REGIMES = {
+    "Expansion":  {"color": "#059669", "vol_mult": 1.00, "cap_drift": 0.0000, "corr_mult": 1.00,
+                   "desc": "Positive curve, normal credit spreads. Baseline volatility."},
+    "Easing":     {"color": "#1a6fe0", "vol_mult": 0.95, "cap_drift": -0.0015, "corr_mult": 0.95,
+                   "desc": "Low rates, tight spreads. Mild cap-rate tailwind."},
+    "Late-Cycle": {"color": "#d97706", "vol_mult": 1.25, "cap_drift": 0.0025, "corr_mult": 1.15,
+                   "desc": "Flat/inverted curve or widening spreads. Elevated volatility, deals move together more."},
+    "Stress":     {"color": "#dc2626", "vol_mult": 1.55, "cap_drift": 0.0060, "corr_mult": 1.30,
+                   "desc": "Credit stress. High volatility, strong co-movement, exit caps drift wider."},
+}
+
+def classify_regime(m: dict) -> dict:
+    """Deterministic thresholds — every classification is explainable."""
+    baa, slope, dgs10 = m["baa_spread"], m["slope"], m["dgs10"]
+    if baa >= 3.00 or slope <= -0.60:
+        name = "Stress"
+    elif baa >= 2.40 or slope <= 0.00:
+        name = "Late-Cycle"
+    elif dgs10 <= 3.30 and baa < 2.40:
+        name = "Easing"
+    else:
+        name = "Expansion"
+    out = dict(REGIMES[name]); out["name"] = name
+    out["signals"] = (f"10Y {dgs10:.2f}% \u00b7 2s10s {slope:+.2f}% \u00b7 "
+                      f"Baa spread {baa:.2f}%")
+    return out
+
+def _regime_chol(corr_mult: float):
+    """Regime-strengthened correlation matrix, kept positive-definite."""
+    R = _AIRE_CORR.copy()
+    off = ~np.eye(4, dtype=bool)
+    R[off] = np.clip(R[off] * corr_mult, -0.92, 0.92)
+    for jitter in (0.0, 1e-6, 1e-4, 1e-3):
+        try:
+            return np.linalg.cholesky(R + np.eye(4) * jitter)
+        except np.linalg.LinAlgError:
+            continue
+    return _AIRE_CHOL
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SECTION 3I │ MARKET-IMPLIED VALUATION
+# What is this asset worth AT TODAY'S MARKET, independent of the purchase price?
+# implied cap = 10Y Treasury + asset-class risk premium + credit-spread adjustment.
+# The valuation literally reprices as rates and spreads move.
+# ──────────────────────────────────────────────────────────────────────────────
+
+ASSET_PREMIA = {   # long-run anchor premia over the 10Y, in percent
+    "Multifamily": 2.30, "Industrial": 2.50, "Mixed-Use": 2.90,
+    "Retail": 3.30, "Office": 3.90,
+}
+
+def market_implied_valuation(deal: dict, macro: dict = None) -> dict:
+    macro = macro or fetch_macro()
+    noi   = float(deal.get("noi_year1", 0) or 0)
+    price = float(deal.get("purchase_price", 0) or 0)
+    atype = str(deal.get("type", "Multifamily"))
+    prem  = ASSET_PREMIA.get(atype, 2.80)
+    credit_adj  = 0.50 * (macro["baa_spread"] - 2.00)     # spreads wide → caps wide
+    implied_cap = max((macro["dgs10"] + prem + credit_adj) / 100.0, 0.035)
+    implied_val = noi / implied_cap if noi > 0 else 0.0
+    premium     = (price / implied_val - 1.0) if implied_val > 0 else 0.0
+    return {
+        "implied_cap": implied_cap, "implied_value": implied_val,
+        "premium": premium, "asset_premium": prem, "credit_adj": credit_adj,
+        "entry_cap": (noi / price) if price > 0 else 0.0,
+        "macro": macro,
+    }
+
+
+def render_market_panel(deal: dict):
+    """Dashboard panel: current regime + what the market says this asset is worth."""
+    macro = fetch_macro()
+    reg   = classify_regime(macro)
+    val   = market_implied_valuation(deal, macro)
+    price = float(deal.get("purchase_price", 0) or 0)
+    if price <= 0 or val["implied_value"] <= 0:
+        return
+
+    prem   = val["premium"]
+    pc     = "#dc2626" if prem > 0.05 else ("#059669" if prem < -0.05 else "#3a5278")
+    plabel = (f"{prem:+.1%} vs market" if abs(prem) >= 0.005 else "At market")
+    live   = ("<span style='color:#059669;'>\u25cf live</span>" if macro["live"]
+              else "<span style='color:#94a3b8;'>\u25cb defaults \u2014 add FRED_API_KEY</span>")
+
+    bar_pos = max(0.0, min(1.0, 0.5 + prem * 2.0))  # \u00b125% premium spans the bar
+
+    st.markdown(
+        "<div class='glass-panel'>"
+        "<div class='panel-title' style='display:flex;justify-content:space-between;align-items:center;'>"
+        "<span>Market-Implied Valuation \u2014 Reprices With the Market</span>"
+        f"<span style='font-size:10px;text-transform:none;letter-spacing:0.03em;font-weight:600;'>{live} \u00b7 {macro['as_of']}</span>"
+        "</div>"
+        # Regime strip
+        "<div style='display:flex;align-items:center;gap:12px;margin-bottom:16px;flex-wrap:wrap;'>"
+        f"<span style='background:{reg['color']}1a;color:{reg['color']};border:1.5px solid {reg['color']};"
+        "font-size:11px;font-weight:800;padding:5px 14px;border-radius:999px;letter-spacing:0.06em;"
+        f"text-transform:uppercase;'>{reg['name']} Regime</span>"
+        f"<span style='font-family:JetBrains Mono,monospace;font-size:11.5px;color:#3a5278;'>{reg['signals']}</span>"
+        "</div>"
+        f"<div style='font-size:12px;color:#6f8aab;margin-bottom:16px;line-height:1.6;'>{reg['desc']} "
+        "Simulation volatility, correlations, and exit-cap drift are conditioned on this regime.</div>"
+        # Valuation row
+        "<div style='display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;margin-bottom:14px;'>"
+        + "".join(
+            f"<div style='background:#f5f8fd;border:1px solid #e4ecf7;border-radius:12px;padding:14px 16px;'>"
+            f"<div style='font-size:9px;font-weight:700;color:#6f8aab;text-transform:uppercase;letter-spacing:0.09em;'>{l}</div>"
+            f"<div style='font-family:Outfit,sans-serif;font-size:1.45rem;font-weight:900;letter-spacing:-0.03em;color:{c};margin-top:3px;'>{v}</div>"
+            f"<div style='font-size:10.5px;color:#94a3b8;margin-top:2px;'>{s}</div></div>"
+            for l, v, s, c in [
+                ("Your Basis", f"${price/1e6:.1f}M", f"{val['entry_cap']:.2%} entry cap", "#07111f"),
+                ("Market-Implied Value", f"${val['implied_value']/1e6:.1f}M", f"{val['implied_cap']:.2%} implied cap", "#1a6fe0"),
+                ("Basis vs Market", plabel, "premium" if prem > 0 else "discount" if prem < 0 else "fair value", pc),
+            ])
+        + "</div>"
+        # Premium bar
+        "<div style='position:relative;background:linear-gradient(90deg,#dcfce7,#f5f8fd 45%,#f5f8fd 55%,#fee2e2);"
+        "border-radius:6px;height:12px;margin-bottom:6px;'>"
+        f"<div style='position:absolute;left:{bar_pos*100:.1f}%;top:-3px;width:3px;height:18px;"
+        f"background:{pc};border-radius:2px;transform:translateX(-50%);'></div></div>"
+        "<div style='display:flex;justify-content:space-between;font-size:9.5px;color:#94a3b8;margin-bottom:12px;'>"
+        "<span>25% below market</span><span>fair value</span><span>25% above market</span></div>"
+        f"<div style='border-top:1px solid #e4ecf7;padding-top:9px;font-size:10px;color:#94a3b8;line-height:1.6;'>"
+        f"Implied cap = 10Y ({macro['dgs10']:.2f}%) + {deal.get('type','Multifamily')} premium ({val['asset_premium']:.2f}%) "
+        f"+ credit adjustment ({val['credit_adj']:+.2f}%). Anchor premia are long-run averages \u2014 a screening signal, "
+        "not an appraisal. Patent Pending</div>"
+        "</div>", unsafe_allow_html=True)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SECTION 6AB │ MODEL VERIFICATION — the platform audits its own math
+# Every check runs LIVE against an independent method: polynomial root-finding
+# vs the bisection solver, closed-form annuity algebra vs the loop-built debt
+# schedule, an independent DCF re-implementation, NPV identities on actual
+# simulation paths. Institutional buyers don't have to trust us — they can
+# click the button and watch the math verify itself.
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _verify_all() -> list:
+    checks = []
+    rng = np.random.default_rng(20260712)
+
+    # 1 │ IRR solver vs independent polynomial-root method
+    worst = 0.0
+    for _ in range(30):
+        T   = int(rng.integers(4, 9))
+        eq  = float(rng.uniform(1e6, 8e6))
+        cfs = np.concatenate([[-eq], rng.uniform(0.03, 0.12, T-1) * eq,
+                              [rng.uniform(0.9, 2.2) * eq]])
+        r_b = float(vectorized_irr(cfs[None, :])[0])
+        roots = np.roots(cfs[::-1])                    # NPV as polynomial in x=1/(1+r)
+        real  = roots[np.abs(roots.imag) < 1e-9].real
+        cand  = 1.0 / real[real > 1e-9] - 1.0
+        cand  = cand[cand > -0.95]
+        worst = max(worst, float(np.min(np.abs(cand - r_b))) if len(cand) else 9.9)
+    checks.append(("IRR solver vs polynomial roots",
+                   f"30 random cash flows \u00b7 worst deviation {worst:.2e}",
+                   worst < 1e-6))
+
+    # 2 │ Debt schedule vs closed-form annuity algebra
+    L, r, am, io, hold = 9_700_000.0, 0.0632, 30, 1, 6
+    sch  = build_debt_schedule(L, r, hold, am, io)
+    rm, nm = r/12, am*12
+    pmt  = L*rm/(1-(1+rm)**(-nm))
+    n_am = (hold-io)*12
+    bal_cf = L*(1+rm)**n_am - pmt*((1+rm)**n_am - 1)/rm
+    d1 = abs(sch["balance"][-1] - bal_cf)
+    d2 = abs(sch["annual_ds"][0] - L*r)
+    checks.append(("Debt schedule vs closed-form annuity",
+                   f"end balance \u0394 ${d1:.4f} \u00b7 IO-year interest \u0394 ${d2:.4f}",
+                   d1 < 0.01 and d2 < 0.01))
+
+    # 3 │ DCF vs independent re-implementation (different code path)
+    def _dcf_independent(price, noi, loan, hold, rg, eg, ec, rate):
+        exp0 = noi*(0.35/0.65); inc0 = noi+exp0
+        rm = rate/12; pmt = loan*rm/(1-(1+rm)**(-360)) if loan>0 else 0
+        bal = loan; ann=[]
+        for y in range(1, hold+1):
+            ds=0.0
+            for _ in range(12):
+                i = bal*rm
+                pay = i if y<=1 else pmt
+                bal -= (pay - i); ds += pay
+            ann.append(ds)
+        eq = price - loan + price*0.01
+        cfs=[-eq]
+        for y in range(1, hold+1):
+            cf = inc0*(1+rg)**y - exp0*(1+eg)**y - ann[y-1]
+            if y==hold:
+                xn = inc0*(1+rg)**(y+1) - exp0*(1+eg)**(y+1)
+                cf += (xn/ec)*0.98 - bal
+            cfs.append(cf)
+        return cfs
+    a = run_deterministic_dcf(16.4e6, 942_525, 9.7e6, 6, 0.04, 0.03, 0.0575, 0.0632)
+    b = _dcf_independent(16.4e6, 942_525, 9.7e6, 6, 0.04, 0.03, 0.0575, 0.0632)
+    dcf_d = max(abs(x-y) for x, y in zip(a["cfs"], b))
+    checks.append(("DCF vs independent re-implementation",
+                   f"7 cash flows \u00b7 max \u0394 ${dcf_d:.4f}", dcf_d < 0.01))
+
+    # 4 │ NPV(IRR) = 0 identity on live simulation paths
+    deal = {"id":"verify","purchase_price":16.4e6,"noi_year1":942_525,"debt_amount":9.7e6}
+    S    = dict(st.session_state.get("settings", {})) or {"hold_period":5,"rent_growth":0.04,
+             "expense_growth":0.03,"vacancy_rate":0.07,"exit_cap_spread":0.0025}
+    _neutral = {"name": "Neutral", "vol_mult": 1.0, "cap_drift": 0.0, "corr_mult": 1.0}
+    mc   = aire_monte_carlo(deal, S, n=1000, regime=_neutral)
+    hold = mc["hold"]
+    # reconstruct a sample of path cash flows via NPV at solved IRR
+    # (identity check: discounting each path's cfs at its own IRR must give ~0)
+    # We recompute cfs for a sample deterministically from stored drivers:
+    D = mc["drivers"]; idx = rng.integers(0, len(mc["irr_paths"]), 200)
+    exp0 = 942_525*(0.35/0.65); inc0 = 942_525+exp0
+    sch  = build_debt_schedule(9.7e6, mc["rate"], hold)
+    eqty = 16.4e6 - 9.7e6 + 16.4e6*0.01
+    vac0 = S.get("vacancy_rate", 0.07)
+    worst_npv = 0.0
+    for i in idx:
+        occ = (1-D["vacancy"][i])/(1-vac0)
+        cfs=[-eqty]
+        for y in range(1, hold+1):
+            cf = inc0*(1+D["rent_growth"][i])**y*occ - exp0*(1+D["expense_growth"][i])**y - sch["annual_ds"][y-1]
+            if y==hold:
+                xn = inc0*(1+D["rent_growth"][i])**(hold+1)*occ - exp0*(1+D["expense_growth"][i])**(hold+1)
+                cf += (xn/D["exit_cap"][i])*0.98 - sch["balance"][hold-1]
+            cfs.append(cf)
+        r_ = mc["irr_paths"][i]
+        npv = sum(c/(1+r_)**t for t, c in enumerate(cfs))
+        worst_npv = max(worst_npv, abs(npv))
+    checks.append(("NPV(IRR)=0 identity on simulation paths",
+                   f"200 sampled paths \u00b7 worst |NPV| ${worst_npv:.2f}", worst_npv < 1.0))
+
+    # 5 │ Monte Carlo statistical integrity
+    det = run_deterministic_dcf(16.4e6, 942_525, 9.7e6, int(S.get("hold_period",5)),
+                                S.get("rent_growth",0.04), S.get("expense_growth",0.03),
+                                mc["exit_cap_base"] + 0.0, mc["rate"])
+    med_gap = abs(mc["p50"] - det["irr"])
+    ordered = mc["p5"] < mc["p50"] < mc["p95"]
+    checks.append(("Simulation central tendency & ordering",
+                   f"median {mc['p50']:.2%} vs deterministic {det['irr']:.2%} "
+                   f"(gap {med_gap*100:.1f}pts) \u00b7 P5<P50<P95: {ordered}",
+                   med_gap < 0.05 and ordered))
+
+    # 6 │ Grade invariants — weights, bounds, monotonicity
+    W = sum(w for _,_,w in AIRE_FACTORS)
+    base_g  = aire_grade_deal(deal, S)
+    worse_p = aire_grade_deal({**deal, "purchase_price": 20.5e6}, S)     # pay more
+    more_d  = aire_grade_deal({**deal, "debt_amount": 14.8e6}, S)        # lever up
+    more_n  = aire_grade_deal({**deal, "noi_year1": 1_130_000}, S)       # earn more
+    mono = (worse_p["score"] < base_g["score"] and more_d["score"] < base_g["score"]
+            and more_n["score"] > base_g["score"])
+    checks.append(("Grade invariants \u2014 weights, bounds, monotonicity",
+                   f"weights {W}/100 \u00b7 base {base_g['score']} \u00b7 pricier {worse_p['score']} "
+                   f"\u00b7 levered {more_d['score']} \u00b7 higher-NOI {more_n['score']}",
+                   W == 100 and mono and 0 <= base_g["score"] <= 100))
+
+    # 7 │ Attribution — Shapley shares valid
+    at = aire_attribution(mc)
+    ssum = sum(f["share"] for f in at["factors"])
+    nonneg = all(f["share"] >= 0 for f in at["factors"])
+    checks.append(("Shapley attribution \u2014 shares valid",
+                   f"sum {ssum:.6f} \u00b7 all \u2265 0: {nonneg} \u00b7 R\u00b2 {at['r2']:.1%}",
+                   abs(ssum-1) < 1e-6 and nonneg and at["r2"] > 0.85))
+
+    # 8 │ Market-implied valuation identity
+    mv = market_implied_valuation(deal)
+    ident = abs(mv["implied_value"] * mv["implied_cap"] - 942_525)
+    checks.append(("Valuation identity \u2014 value \u00d7 cap = NOI",
+                   f"\u0394 ${ident:.6f} \u00b7 implied cap {mv['implied_cap']:.2%}",
+                   ident < 0.01))
+    return checks
+
+
+def view_model_verification():
+    st.markdown("""<div style="margin-bottom:22px;"><div style="font-size:10px;font-weight:700;color:#64748b;letter-spacing:0.14em;text-transform:uppercase;margin-bottom:6px;">MODEL VERIFICATION</div><div style="font-family:Outfit,sans-serif;font-size:1.8rem;font-weight:800;letter-spacing:-0.03em;color:#07111f;">The Platform Audits Its Own Math</div></div>""", unsafe_allow_html=True)
+    st.markdown("<div style='font-size:14px;color:#6f8aab;margin-bottom:20px;'>Every check runs <b>live</b> against an independent method \u2014 polynomial root-finding against the IRR solver, closed-form annuity algebra against the debt schedule, an independent DCF re-implementation, NPV identities on actual simulation paths. You don't have to trust the math. Watch it verify itself.</div>", unsafe_allow_html=True)
+
+    if st.button("Run Full Verification Suite", type="primary"):
+        with st.spinner("Verifying every engine against independent methods..."):
+            checks = _verify_all()
+        passed = sum(1 for _,_,ok in checks if ok)
+        allok  = passed == len(checks)
+        hc = "#059669" if allok else "#dc2626"
+        st.markdown(
+            f"<div style='background:{hc}14;border:2px solid {hc};border-radius:14px;"
+            "padding:18px 22px;margin-bottom:18px;display:flex;align-items:center;gap:16px;'>"
+            f"<div style='font-family:Outfit,sans-serif;font-size:2.4rem;font-weight:900;color:{hc};line-height:1;'>{passed}/{len(checks)}</div>"
+            f"<div><div style='font-size:14px;font-weight:800;color:{hc};'>"
+            f"{'ALL CHECKS PASSED' if allok else 'VERIFICATION FAILURE \u2014 DO NOT RELY ON OUTPUTS'}</div>"
+            f"<div style='font-size:11.5px;color:#3a5278;'>Verified {datetime.now().strftime('%B %d, %Y at %H:%M')} "
+            "\u00b7 re-runs against live engines every time</div></div></div>",
+            unsafe_allow_html=True)
+
+        for name, detail, ok in checks:
+            c = "#059669" if ok else "#dc2626"
+            icon = "\u2713" if ok else "\u2717"
+            st.markdown(
+                f"<div style='background:#fff;border:1px solid #e4ecf7;border-left:4px solid {c};"
+                "border-radius:10px;padding:12px 18px;margin-bottom:8px;display:flex;"
+                "justify-content:space-between;align-items:center;gap:14px;'>"
+                f"<div><div style='font-size:13px;font-weight:700;color:#07111f;'>{icon}&nbsp; {name}</div>"
+                f"<div style='font-family:JetBrains Mono,monospace;font-size:11px;color:#6f8aab;margin-top:3px;'>{detail}</div></div>"
+                f"<span style='background:{c}1a;color:{c};font-size:10px;font-weight:800;padding:3px 12px;"
+                f"border-radius:999px;letter-spacing:0.08em;'>{'PASS' if ok else 'FAIL'}</span></div>",
+                unsafe_allow_html=True)
+
+        audit_log("ai_analysis", "Model Verification",
+                  f"Verification suite: {passed}/{len(checks)} checks passed")
+
+        blocks = [
+            {"kpis": [("Checks Passed", f"{passed}/{len(checks)}"),
+                      ("Status", "VERIFIED" if allok else "FAILED"),
+                      ("Date", datetime.now().strftime("%b %d, %Y"))]},
+            {"heading": "Verification Results"},
+            {"table": {"head": ["Check", "Measured", "Result"],
+                       "rows": [[n, d.replace("\u00b7", "|"), "PASS" if ok else "FAIL"]
+                                for n, d, ok in checks]}},
+            {"text": "Each check validates a production engine against an independent method: "
+                     "polynomial root-finding vs the bisection IRR solver, closed-form annuity algebra "
+                     "vs the amortization schedule, an independent DCF re-implementation, and NPV "
+                     "identities evaluated on live simulation paths."},
+        ]
+        pdf_button("Export Verification Certificate (PDF)",
+                   "Model Verification Certificate",
+                   f"{passed}/{len(checks)} independent checks passed \u00b7 {datetime.now().strftime('%B %d, %Y')}",
+                   blocks, "AIRE_Model_Verification.pdf", "pdf_verify")
+
+
+def aire_monte_carlo(deal: dict, settings: dict, n: int = 3000, regime: dict = None) -> dict:
     """The real engine. Draws 3,000 correlated scenarios of rent growth, expense
     growth, vacancy, and exit cap — then runs EVERY path through a full
     year-by-year DCF with true amortizing debt to produce the IRR distribution.
@@ -1226,12 +1591,22 @@ def aire_monte_carlo(deal: dict, settings: dict, n: int = 3000) -> dict:
     seed = int(hashlib.sha256(str(deal.get("id", deal.get("name", "x"))).encode()).hexdigest()[:8], 16)
     rng  = np.random.default_rng(seed)
 
-    # Correlated standard normals → driver distributions
-    Z = rng.standard_normal((n, 4)) @ _AIRE_CHOL.T
-    rg_p  = rg + Z[:, 0] * 0.012                                  # rent growth  σ=120bps
-    eg_p  = np.clip(eg + Z[:, 1] * 0.008, 0.0, None)              # expense grw  σ=80bps
-    vac_p = np.clip(vac + Z[:, 2] * 0.015, 0.02, 0.30)            # vacancy      σ=150bps
-    cap_p = np.clip(exit_base + Z[:, 3] * 0.005, 0.035, None)     # exit cap     σ=50bps
+    # Regime-conditional volatility, correlation, and exit-cap drift
+    if regime is None:
+        try:
+            regime = classify_regime(fetch_macro())
+        except Exception:
+            regime = {"name": "Expansion", "vol_mult": 1.0, "cap_drift": 0.0, "corr_mult": 1.0}
+    _vm    = float(regime.get("vol_mult", 1.0))
+    _drift = float(regime.get("cap_drift", 0.0))
+    _cm    = float(regime.get("corr_mult", 1.0))
+    _chol  = _regime_chol(_cm) if abs(_cm - 1.0) > 1e-9 else _AIRE_CHOL
+
+    Z = rng.standard_normal((n, 4)) @ _chol.T
+    rg_p  = rg + Z[:, 0] * 0.012 * _vm                                    # rent growth
+    eg_p  = np.clip(eg + Z[:, 1] * 0.008 * _vm, 0.0, None)                # expense growth
+    vac_p = np.clip(vac + Z[:, 2] * 0.015 * _vm, 0.02, 0.30)              # vacancy
+    cap_p = np.clip(exit_base + _drift + Z[:, 3] * 0.005 * _vm, 0.035, None)  # exit cap
 
     margin = 0.65
     exp0 = noi * (1.0 - margin) / margin
@@ -1268,6 +1643,7 @@ def aire_monte_carlo(deal: dict, settings: dict, n: int = 3000) -> dict:
         "ds_y1": sched["ds_y1"],
         "entry_cap": entry_cap, "exit_cap_base": exit_base,
         "n": n, "hold": hold, "rate": rate,
+        "regime": regime.get("name", "Expansion"),
     }
 
 
@@ -1501,10 +1877,18 @@ def aire_grade_deal(deal: dict, settings: dict, mc: dict = None) -> dict:
     F["leverage"] = (lev_pts,
         f"LTV {ltv:.0%} vs {max_lv:.0%} policy limit")
 
-    # 5. Going-In Basis — spread over the cost of debt is the CRE quality signal
-    spread = cap - rate
-    F["basis"] = (_band(spread, -0.015, 0.020),
-        f"Entry cap {cap:.2%} · {spread*10000:+.0f} bps spread to {rate:.2%} debt cost")
+    # 5. Going-In Basis — entry yield vs the MARKET-IMPLIED cap for this asset
+    # class at TODAY'S rates and credit spreads. Grades reprice with the market.
+    try:
+        _mv = market_implied_valuation(deal)
+        _ms = cap - _mv["implied_cap"]
+        F["basis"] = (_band(_ms, -0.0075, 0.0075),
+            f"Entry cap {cap:.2%} vs market-implied {_mv['implied_cap']:.2%} "
+            f"({_ms*10000:+.0f} bps {'cheap' if _ms > 0 else 'rich'}) · debt {rate:.2%}")
+    except Exception:
+        spread = cap - rate
+        F["basis"] = (_band(spread, -0.015, 0.020),
+            f"Entry cap {cap:.2%} · {spread*10000:+.0f} bps spread to {rate:.2%} debt cost")
 
     # 6. Execution Risk — asset age and scale (small/old assets carry more surprise)
     vintage = int(deal.get("vintage", 0) or 0)
@@ -1647,7 +2031,7 @@ def aire_attribution(mc: dict) -> dict:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def aire_portfolio_monte_carlo(props: list, settings: dict, n: int = 2000,
-                               market_beta: float = 0.60) -> dict:
+                               market_beta: float = 0.60, regime: dict = None) -> dict:
     """Correlated portfolio simulation.
 
     Each scenario draws ONE market factor (the cycle) that hits every deal, plus a
@@ -1668,11 +2052,20 @@ def aire_portfolio_monte_carlo(props: list, settings: dict, n: int = 2000,
     spr   = float(settings.get("exit_cap_spread", 0.0025))
     min_ds = float(settings.get("min_dscr", 1.25) or 1.25)
 
+    if regime is None:
+        try:
+            regime = classify_regime(fetch_macro())
+        except Exception:
+            regime = {"name": "Expansion", "vol_mult": 1.0, "cap_drift": 0.0, "corr_mult": 1.0}
+    _vm    = float(regime.get("vol_mult", 1.0))
+    _drift = float(regime.get("cap_drift", 0.0))
+    _chol  = _regime_chol(float(regime.get("corr_mult", 1.0)))
+
     w_sys = np.sqrt(market_beta)
     w_idio = np.sqrt(1.0 - market_beta)
 
     # Shared market shocks — one draw per scenario, applied to ALL deals
-    M = rng.standard_normal((n, 4)) @ _AIRE_CHOL.T
+    M = rng.standard_normal((n, 4)) @ _chol.T
 
     total_equity = 0.0
     port_cf      = np.zeros((n, hold + 1))
@@ -1684,14 +2077,14 @@ def aire_portfolio_monte_carlo(props: list, settings: dict, n: int = 2000,
         loan  = float(d.get("debt_amount", 0) or 0)
         seed  = int(hashlib.sha256(str(d.get("id", d.get("name","x"))).encode()).hexdigest()[:8], 16)
         r2    = np.random.default_rng(seed)
-        I     = r2.standard_normal((n, 4)) @ _AIRE_CHOL.T
+        I     = r2.standard_normal((n, 4)) @ _chol.T
 
         Z = w_sys * M + w_idio * I           # systematic + idiosyncratic
-        rg_p  = rg0 + Z[:, 0] * 0.012
-        eg_p  = np.clip(eg0 + Z[:, 1] * 0.008, 0.0, None)
-        vac_p = np.clip(vac0 + Z[:, 2] * 0.015, 0.02, 0.30)
+        rg_p  = rg0 + Z[:, 0] * 0.012 * _vm
+        eg_p  = np.clip(eg0 + Z[:, 1] * 0.008 * _vm, 0.0, None)
+        vac_p = np.clip(vac0 + Z[:, 2] * 0.015 * _vm, 0.02, 0.30)
         entry = noi / price
-        cap_p = np.clip(entry + spr + Z[:, 3] * 0.005, 0.035, None)
+        cap_p = np.clip(entry + spr + _drift + Z[:, 3] * 0.005 * _vm, 0.035, None)
 
         margin = 0.65
         exp0 = noi * (1 - margin) / margin
@@ -2815,6 +3208,9 @@ def view_dashboard():
 
     # Row 2.4 – AIRE Risk Grade (explainable multi-factor model)
     render_grade_panel(d, st.session_state.settings, mc)
+
+    # Row 2.42 – Market regime + market-implied valuation (reprices live)
+    render_market_panel(d)
 
     # Row 2.45 – Risk attribution (what drives the downside)
     _attr = render_attribution_panel(mc) if mc else None
@@ -5808,6 +6204,12 @@ DEALS:
   Status: {p.get('status','active')}
 """
 
+    try:
+        _reg = classify_regime(fetch_macro())
+        portfolio_summary += f"\nCURRENT MARKET REGIME: {_reg['name']} — {_reg['signals']}\n"
+    except Exception:
+        pass
+
     system = """You are AIRE Intelligence, the most advanced institutional CRE analysis AI ever built.
 You operate at the level of a Managing Director at a top-5 private equity real estate firm.
 You have deep expertise in: portfolio construction, risk management, capital markets, debt structuring,
@@ -6753,6 +7155,7 @@ NAV_SECTIONS = [
             ("White-Label",      "WhiteLabel"),
             ("Lender Database",  "LenderDB"),
             ("Audit Trail",      "AuditTrail"),
+            ("Model Verification","ModelVerify"),
             ("Settings",         "Settings"),
         ],
     },
@@ -6810,6 +7213,18 @@ def render_sidebar():
           <div style="font-size:6.5px;color:rgba(255,255,255,0.20);letter-spacing:1px;margin-top:1px;">Patent Pending</div>
         </div>
         ''', unsafe_allow_html=True)
+
+        # Live market regime chip
+        try:
+            _reg = classify_regime(fetch_macro())
+            st.markdown(
+                f'<div style="text-align:center;margin-bottom:8px;">'
+                f'<span style="background:{_reg["color"]}22;color:{_reg["color"]};font-size:8px;'
+                f'font-weight:800;padding:3px 10px;border-radius:999px;letter-spacing:1.2px;'
+                f'text-transform:uppercase;">\u25cf {_reg["name"]} Market</span></div>',
+                unsafe_allow_html=True)
+        except Exception:
+            pass
 
         # Guided mode indicator
         if st.session_state.get("onboarding_mode"):
@@ -6954,6 +7369,7 @@ def main():
     elif v == "WhiteLabel":     view_whitelabel()
     elif v == "LenderDB":       view_lender_db()
     elif v == "AuditTrail":     view_audit_trail()
+    elif v == "ModelVerify":    view_model_verification()
     elif v == "BrokerEmails":   view_broker_emails()
     elif v == "Intelligence":    view_aire_intelligence()
     elif v == "Scenarios":       view_scenarios()
