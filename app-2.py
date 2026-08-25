@@ -1524,12 +1524,13 @@ def view_model_verification():
         passed = sum(1 for _,_,ok in checks if ok)
         allok  = passed == len(checks)
         hc = "#059669" if allok else "#dc2626"
+        _vmsg = "ALL CHECKS PASSED" if allok else "VERIFICATION FAILURE — DO NOT RELY ON OUTPUTS"
         st.markdown(
             f"<div style='background:{hc}14;border:2px solid {hc};border-radius:14px;"
             "padding:18px 22px;margin-bottom:18px;display:flex;align-items:center;gap:16px;'>"
             f"<div style='font-family:Outfit,sans-serif;font-size:2.4rem;font-weight:900;color:{hc};line-height:1;'>{passed}/{len(checks)}</div>"
             f"<div><div style='font-size:14px;font-weight:800;color:{hc};'>"
-            f"{'ALL CHECKS PASSED' if allok else 'VERIFICATION FAILURE \u2014 DO NOT RELY ON OUTPUTS'}</div>"
+            f"{_vmsg}</div>"
             f"<div style='font-size:11.5px;color:#3a5278;'>Verified {datetime.now().strftime('%B %d, %Y at %H:%M')} "
             "\u00b7 re-runs against live engines every time</div></div></div>",
             unsafe_allow_html=True)
