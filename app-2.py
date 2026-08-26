@@ -607,13 +607,27 @@ def inject_css():
 # SECTION 2 │ CLIENTS & STATE
 # ──────────────────────────────────────────────────────────────────────────────
 def get_supabase():
-    """Get a fresh Supabase client every call — never cache None."""
+    """Fresh Supabase client with the signed-in user's JWT attached, so
+    Postgres Row-Level Security enforces tenant isolation on EVERY query.
+    Before login the client is anonymous (enough for sign-in itself)."""
     try:
         url = st.secrets.get("SUPABASE_URL", "")
         key = st.secrets.get("SUPABASE_KEY", "")
         if not url or not key:
             return None, "Missing SUPABASE_URL or SUPABASE_KEY in secrets"
-        return create_client(url, key), None
+        sb = create_client(url, key)
+        tok = st.session_state.get("sb_access_token")
+        ref = st.session_state.get("sb_refresh_token")
+        if tok and ref:
+            try:
+                sb.auth.set_session(tok, ref)
+                s = sb.auth.get_session()
+                if s and getattr(s, "access_token", None):
+                    st.session_state.sb_access_token  = s.access_token
+                    st.session_state.sb_refresh_token = s.refresh_token
+            except Exception:
+                pass
+        return sb, None
     except Exception as e:
         return None, str(e)
 
@@ -718,6 +732,26 @@ def init_state():
 # SECTION 2B │ SUPABASE PERSISTENCE (BULLETPROOF)
 # ──────────────────────────────────────────────────────────────────────────────
 
+def identity_key(address: str) -> str:
+    """Normalized property identity — powers firm memory ('you saw this before')."""
+    a = re.sub(r"[^a-z0-9 ]", " ", str(address or "").lower())
+    a = re.sub(r"\b(suite|ste|unit|apt|bldg|floor|fl)\s*\w*\b", " ", a)
+    return re.sub(r"\s+", " ", a).strip()[:120]
+
+
+def firm_memory_match(address: str, exclude_id=None):
+    """Return a previously screened deal at the same property, if any."""
+    ik = identity_key(address)
+    if not ik:
+        return None
+    for p in st.session_state.get("properties", []):
+        if p.get("id") == exclude_id:
+            continue
+        if identity_key(p.get("address", "")) == ik:
+            return p
+    return None
+
+
 def firm_key(email: str) -> str:
     if not email or '@' not in email:
         return "unknown"
@@ -754,6 +788,18 @@ def db_save(prop: dict, email: str) -> tuple:
             "ai_correct":       bool(prop.get("ai_correct",True)),
             "lat":              float(prop.get("lat",0)),
             "lon":              float(prop.get("lon",0)),
+            # ── Decision ledger (the company's asset) ──
+            "broker_name":      str(prop.get("broker_name",""))[:120],
+            "broker_shop":      str(prop.get("broker_shop",""))[:120],
+            "guidance_price":   float(prop.get("guidance_price",0) or 0),
+            "decision":         str(prop.get("decision",""))[:20],
+            "decision_reason":  str(prop.get("decision_reason",""))[:40],
+            "decision_note":    str(prop.get("decision_note",""))[:500],
+            "revisit_price":    float(prop.get("revisit_price",0) or 0),
+            "decided_at":       str(prop.get("decided_at",""))[:40] or None,
+            "identity_key":     identity_key(prop.get("address","")),
+            "n_flags":          int(prop.get("n_flags",0) or 0),
+            "n_watch":          int(prop.get("n_watch",0) or 0),
         }
         sb.table("aire_properties").upsert(rec, on_conflict="firm_key,prop_id").execute()
         comps_contribute(prop, email, st.session_state.get("settings", {}))
@@ -793,6 +839,16 @@ def db_load(email: str) -> tuple:
                 "notes":          r.get("notes",""),
                 "ai_prediction":  r.get("ai_prediction",0),
                 "ai_correct":     r.get("ai_correct",True),
+                "broker_name":    r.get("broker_name","") or "",
+                "broker_shop":    r.get("broker_shop","") or "",
+                "guidance_price": float(r.get("guidance_price") or 0),
+                "decision":       r.get("decision","") or "",
+                "decision_reason":r.get("decision_reason","") or "",
+                "decision_note":  r.get("decision_note","") or "",
+                "revisit_price":  float(r.get("revisit_price") or 0),
+                "decided_at":     r.get("decided_at","") or "",
+                "n_flags":        int(r.get("n_flags") or 0),
+                "n_watch":        int(r.get("n_watch") or 0),
                 "lat":            r.get("lat",0.0),
                 "lon":            r.get("lon",-96.7970),
             })
@@ -930,7 +986,10 @@ def _extract_market(address: str):
     return "Undisclosed", ""
 
 def comps_contribute(prop: dict, email: str, settings: dict = None):
-    """Fire-and-forget anonymized contribution. Respects the firm's opt-in setting."""
+    """PAUSED (Stage 3). Cross-firm assumption sharing returns only as a lagged,
+    aggregated, k-anonymous product designed with antitrust counsel — the
+    RealPage litigation is the reference case. No data leaves the firm."""
+    return
     try:
         settings = settings or {}
         if not settings.get("comps_optin", True):
@@ -1119,6 +1178,8 @@ def reunderwrite_all(props: list, settings: dict) -> list:
             p["loss_prob"]   = g["loss_prob"]
             p["score"]       = g["score"]
             p["grade"]       = g["grade"]
+            p["n_flags"]     = g["n_flags"]
+            p["n_watch"]     = g["n_watch"]
         except Exception:
             continue  # never let a bad record block the app
     return props
@@ -1885,6 +1946,17 @@ AIRE_FACTORS = [
     ("execution", "Execution Risk",         8),
 ]
 
+def screen_label(nf, nw):
+    """Canonical screen status — flags vs the firm's policy, never a score."""
+    nf, nw = int(nf or 0), int(nw or 0)
+    if nf: return (f"{nf} Flag" + ("s" if nf > 1 else ""), "#991b1b", "#fee2e2")
+    if nw: return (f"{nw} Watch", "#92400e", "#fef9c3")
+    return ("Clear", "#166534", "#dcfce7")
+
+def deal_screen(p: dict):
+    return screen_label(p.get("n_flags", 0), p.get("n_watch", 0))
+
+
 def _band(v, lo, hi):
     """Linear 0–1 score between a failing floor and a full-credit ceiling."""
     if hi == lo:
@@ -1901,7 +1973,7 @@ def aire_grade_deal(deal: dict, settings: dict, mc: dict = None) -> dict:
     units = int(deal.get("units", 0) or 0)
 
     if price <= 0 or noi <= 0:
-        return {"score": 0, "grade": "D", "factors": [], "irr": 0.0, "em": 1.0,
+        return {"score": 0, "grade": "D", "factors": [], "n_flags": 1, "n_watch": 0, "irr": 0.0, "em": 1.0,
                 "loss_prob": 0.0, "dscr": 0.0, "ltv": 0.0, "cap": 0.0,
                 "drivers": [], "drags": ["Incomplete deal data — price and NOI required."]}
 
@@ -2000,8 +2072,11 @@ def aire_grade_deal(deal: dict, settings: dict, mc: dict = None) -> dict:
     drivers = [f["why"] for f in ranked if f["pct"] >= 0.70][:3]
     drags   = [f["why"] for f in reversed(ranked) if f["pct"] < 0.50][:3]
 
+    n_flags = sum(1 for f in factors if f["pct"] < 0.35)
+    n_watch = sum(1 for f in factors if 0.35 <= f["pct"] < 0.55)
     return {
         "score": score, "grade": grade, "factors": factors,
+        "n_flags": n_flags, "n_watch": n_watch,
         "irr": irr, "em": em, "loss_prob": lossp, "dscr": dscr,
         "ltv": ltv, "cap": cap, "p5": p5,
         "drivers": drivers, "drags": drags,
@@ -2232,6 +2307,118 @@ GRADE_STYLES = {
     "D": ("#991b1b", "#fee2e2", "Below Threshold"),
 }
 
+
+PASS_REASONS = ["Price", "Market", "Asset Quality", "Sponsor", "Debt / Structure", "Timing", "Other"]
+
+def render_decision_panel(d: dict):
+    """Screening decision capture — pursue / pass / revisit with a REQUIRED
+    pass reason and a 'revisit at' price. This ledger is the company's asset:
+    a time-locked record no competitor (and no firm) can ever backfill."""
+    props = st.session_state.get("properties", [])
+
+    # North Star strip: Decision-Recorded Deals
+    decided = [p for p in props if p.get("decision")]
+    week_ago = datetime.now() - timedelta(days=7)
+    this_week = 0
+    for p in decided:
+        try:
+            if datetime.fromisoformat(str(p.get("decided_at","")).split("+")[0].replace("Z","")) >= week_ago:
+                this_week += 1
+        except Exception:
+            pass
+    passes = [p for p in decided if p.get("decision") == "pass"]
+    with_reason = sum(1 for p in passes if p.get("decision_reason"))
+    reason_pct = (with_reason / len(passes) * 100) if passes else 100
+
+    mem = firm_memory_match(d.get("address",""), exclude_id=d.get("id"))
+    mem_html = ""
+    if mem and mem.get("decision"):
+        _when = str(mem.get("decided_at",""))[:10]
+        mem_html = ("<div style='background:#f0f6ff;border:1px solid #cfe0f7;border-radius:10px;"
+                    "padding:10px 14px;margin-bottom:12px;font-size:12.5px;color:#1e3a5f;'>"
+                    f"<b>Firm memory:</b> you screened this property before ({_when}) — decision: "
+                    f"<b>{mem['decision'].upper()}</b>"
+                    + (f" ({mem.get('decision_reason','')})" if mem.get("decision_reason") else "")
+                    + (f" · would revisit at ${mem['revisit_price']/1e6:.1f}M" if mem.get("revisit_price") else "")
+                    + "</div>")
+
+    st.markdown(
+        "<div class='glass-panel' style='margin-bottom:0;'>"
+        "<div class='panel-title' style='display:flex;justify-content:space-between;align-items:center;'>"
+        "<span>Screening Decision — The Firm Ledger</span>"
+        f"<span style='font-size:10px;text-transform:none;letter-spacing:0.02em;font-weight:600;color:#6f8aab;'>"
+        f"{len(decided)} decisions recorded · {this_week} this week · {reason_pct:.0f}% of passes with reason</span>"
+        "</div>" + mem_html, unsafe_allow_html=True)
+
+    cur = d.get("decision", "")
+    if cur:
+        cmap = {"pursue": ("#059669","#dcfce7","PURSUE"), "pass": ("#dc2626","#fee2e2","PASS"),
+                "revisit": ("#d97706","#fef9c3","REVISIT")}
+        c, bg, lbl = cmap.get(cur, ("#64748b","#f1f5f9",cur.upper()))
+        detail = d.get("decision_reason","")
+        if d.get("decision_note"): detail += f" — {d['decision_note']}"
+        if d.get("revisit_price"): detail += f" · revisit at ${d['revisit_price']/1e6:.1f}M"
+        st.markdown(
+            f"<div style='display:flex;align-items:center;gap:12px;flex-wrap:wrap;'>"
+            f"<span style='background:{bg};color:{c};font-family:Outfit,sans-serif;font-weight:900;"
+            f"font-size:14px;padding:6px 18px;border-radius:999px;letter-spacing:0.05em;'>{lbl}</span>"
+            f"<span style='font-size:12.5px;color:#3a5278;'>{detail}</span>"
+            f"<span style='font-size:11px;color:#94a3b8;'>{str(d.get('decided_at',''))[:16]}</span>"
+            "</div>", unsafe_allow_html=True)
+        if st.button("Change decision", key="dec_change"):
+            st.session_state.dec_pending = "choose"; st.rerun()
+    else:
+        st.session_state.setdefault("dec_pending", "choose")
+
+    pending = st.session_state.get("dec_pending")
+    if (not cur) or pending in ("pursue","pass","revisit"):
+        if pending == "choose" or not pending:
+            b1, b2, b3 = st.columns(3)
+            if b1.button("Pursue", type="primary", use_container_width=True, key="dec_pursue"):
+                st.session_state.dec_pending = "pursue"; st.rerun()
+            if b2.button("Pass", use_container_width=True, key="dec_pass"):
+                st.session_state.dec_pending = "pass"; st.rerun()
+            if b3.button("Revisit Later", use_container_width=True, key="dec_revisit"):
+                st.session_state.dec_pending = "revisit"; st.rerun()
+        else:
+            mode = pending
+            st.markdown(f"<div style='font-size:12px;font-weight:700;color:#07111f;margin:6px 0;'>Recording: {mode.upper()}</div>", unsafe_allow_html=True)
+            reason = ""
+            note   = st.text_input("Rationale (optional)", key="dec_note",
+                                   placeholder="One line the firm will thank you for in three years")
+            rv = 0.0
+            if mode == "pass":
+                reason = st.selectbox("Pass reason (required)", ["— select —"] + PASS_REASONS, key="dec_reason")
+                rv = st.number_input("Would revisit at price ($, optional)", min_value=0.0,
+                                     value=0.0, step=100000.0, key="dec_rv")
+            elif mode == "revisit":
+                rv = st.number_input("Revisit at price ($, optional)", min_value=0.0,
+                                     value=0.0, step=100000.0, key="dec_rv2")
+            cA, cB = st.columns([1,1])
+            if cA.button("Confirm", type="primary", use_container_width=True, key="dec_confirm"):
+                if mode == "pass" and (not reason or reason == "— select —"):
+                    st.error("A pass reason is required — it is the ledger.")
+                else:
+                    d["decision"]        = mode
+                    d["decision_reason"] = reason if mode == "pass" else ""
+                    d["decision_note"]   = note or ""
+                    d["revisit_price"]   = float(rv or 0)
+                    d["decided_at"]      = datetime.now().isoformat()
+                    for i, p in enumerate(st.session_state.properties):
+                        if p.get("id") == d.get("id"):
+                            st.session_state.properties[i] = d
+                    db_save(d, st.session_state.user_email)
+                    audit_log("decision", d.get("name",""),
+                              f"{mode.upper()}" + (f" — {reason}" if reason else "")
+                              + (f" · revisit ${rv/1e6:.1f}M" if rv else "")
+                              + (f" · {note}" if note else ""))
+                    st.session_state.dec_pending = None
+                    st.rerun()
+            if cB.button("Cancel", use_container_width=True, key="dec_cancel"):
+                st.session_state.dec_pending = None; st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
 def render_grade_panel(deal: dict, settings: dict, mc: dict = None):
     """The AIRE Risk Grade panel — the feature no competitor has: a defensible,
     fully explained institutional grade an analyst can take into an IC."""
@@ -2239,7 +2426,20 @@ def render_grade_panel(deal: dict, settings: dict, mc: dict = None):
     if not g["factors"]:
         return g
 
-    color, bg, verdict = GRADE_STYLES.get(g["grade"], GRADE_STYLES["C"])
+    n_flag  = int(g.get("n_flags", 0))
+    n_watch = int(g.get("n_watch", 0))
+    if n_flag:
+        color, bg = "#991b1b", "#fee2e2"
+        _head, _sub = str(n_flag), "POLICY FLAG" + ("S" if n_flag > 1 else "")
+        verdict = "Review flagged factors before IC"
+    elif n_watch:
+        color, bg = "#92400e", "#fef9c3"
+        _head, _sub = str(n_watch), "WATCH ITEM" + ("S" if n_watch > 1 else "")
+        verdict = "Confirm watch items with sources"
+    else:
+        color, bg = "#166534", "#dcfce7"
+        _head, _sub = "\u2713", "CLEAR SCREEN"
+        verdict = "No factor breaches your policy bands"
 
     bars = ""
     for f in g["factors"]:
@@ -2270,15 +2470,15 @@ def render_grade_panel(deal: dict, settings: dict, mc: dict = None):
 
     st.markdown(
         "<div class='glass-panel'>"
-        "<div class='panel-title'>AIRE Risk Grade — Institutional Multi-Factor Model</div>"
+        "<div class='panel-title'>Screening Flags — Six Factors vs Your Firm's Policy</div>"
         "<div style='display:grid;grid-template-columns:200px 1fr;gap:28px;align-items:start;'>"
         # Left: the grade
         "<div style='text-align:center;'>"
         f"<div style='background:{bg};border:2px solid {color};border-radius:18px;padding:20px 12px;'>"
         f"<div style='font-family:Outfit,sans-serif;font-size:4.2rem;font-weight:900;"
-        f"letter-spacing:-0.05em;color:{color};line-height:1;'>{g['grade']}</div>"
-        f"<div style='font-family:JetBrains Mono,monospace;font-size:15px;font-weight:700;"
-        f"color:{color};margin-top:2px;'>{g['score']}<span style='opacity:0.55;'>/100</span></div>"
+        f"letter-spacing:-0.05em;color:{color};line-height:1;'>{_head}</div>"
+        f"<div style='font-family:JetBrains Mono,monospace;font-size:13px;font-weight:700;"
+        f"color:{color};margin-top:2px;letter-spacing:0.08em;'>{_sub}</div>"
         f"<div style='font-size:10.5px;font-weight:700;color:{color};margin-top:8px;"
         f"text-transform:uppercase;letter-spacing:0.06em;line-height:1.35;'>{verdict}</div>"
         "</div>"
@@ -2289,8 +2489,9 @@ def render_grade_panel(deal: dict, settings: dict, mc: dict = None):
         f"<div>{bars}"
         "<div style='border-top:1px solid #e4ecf7;padding-top:9px;margin-top:3px;"
         "font-size:10px;color:#94a3b8;line-height:1.5;'>"
-        "Six weighted factors scored against <b>your firm's</b> targets — every input computed from "
-        "3,000 correlated DCF paths, not heuristics. Fully auditable · Patent Pending"
+        "Six factors evaluated against <b>your firm's own</b> policy bands — flags, not a score. "
+        "Every input computed from 3,000 correlated DCF paths and traceable to its source. "
+        "Calibrated priors replace heuristics as your ledger resolves. Patent Pending"
         "</div></div></div></div>",
         unsafe_allow_html=True
     )
@@ -2336,7 +2537,7 @@ def ai_grade_and_track(prop: dict) -> dict:
         prompt = f"""Analyze this commercial real estate investment and return ONLY a JSON object (no markdown, no explanation):
 Property: {prop['name']}, {prop['units']} units, {prop['type']}, vintage {prop['vintage']}
 Current Metrics: IRR={prop['irr']:.1%}, EM={prop['equity_mult']:.2f}x, NOI Y1=${prop['noi_year1']:,.0f}
-Purchase Price: ${prop['purchase_price']:,.0f}, Grade: {prop['grade']}
+Purchase Price: ${prop['purchase_price']:,.0f}, Screen: {deal_screen(prop)[0]}
 
 Return JSON with these exact keys:
 - "projected_irr_1yr": float (projected IRR in 12 months)
@@ -2567,7 +2768,7 @@ def build_email_html(deal: dict, memo_text: str, rec: str, sender_name: str) -> 
           <div><div class="lbl">Asset</div><div class="val">{deal["name"]}</div></div>
           <div><div class="lbl">Type / Units</div><div class="val">{deal["type"]} / {deal["units"]} Units</div></div>
           <div><div class="lbl">Purchase Price</div><div class="val">${deal["purchase_price"]/1e6:.1f}M</div></div>
-          <div><div class="lbl">Deal Grade</div><div class="val">{deal["grade"]} — {deal["score"]}/100</div></div>
+          <div><div class="lbl">Screen</div><div class="val">{screen_label(deal.get("n_flags",0), deal.get("n_watch",0))[0]}</div></div>
         </div>
         <div class="section-title">Executive Summary</div>
         <div class="summary">{safe_memo if safe_memo else "<em style='color:#94a3b8;'>No summary generated yet.</em>"}</div>
@@ -3055,6 +3256,9 @@ def render_login():
                     if sb:
                         try:
                             resp = sb.auth.sign_in_with_password({"email": email, "password": password})
+                            if getattr(resp, "session", None):
+                                st.session_state.sb_access_token  = resp.session.access_token
+                                st.session_state.sb_refresh_token = resp.session.refresh_token
                             st.session_state.user_email = resp.user.email
                             st.session_state.firm_id    = email.split("@")[1].split(".")[0].upper()
                             st.session_state.db_loaded  = False
@@ -3078,8 +3282,8 @@ def render_login():
                 "stroke='#6f8aab' stroke-width='1' fill='none'/>"
                 "<polyline points='3.4,6.3 5,7.9 7.6,4.9' stroke='#1a6fe0' stroke-width='1.2' "
                 "stroke-linecap='round' stroke-linejoin='round' fill='none'/></svg>"
-                "<span style='font-size:11px;color:#6f8aab;font-weight:500;'>Encrypted in transit and at rest "
-                "&nbsp;\u00b7&nbsp; Access provisioned under contract</span></div>", unsafe_allow_html=True)
+                "<span style='font-size:11px;color:#6f8aab;font-weight:500;'>Tenant-isolated at the database "
+                "&nbsp;\u00b7&nbsp; Never used for model training &nbsp;\u00b7&nbsp; Access under contract</span></div>", unsafe_allow_html=True)
             st.markdown(f"<div style='font-size:11px;color:#94a3b8;margin-top:10px;text-align:center;'>aire.rent &nbsp;&bull;&nbsp; Patent Pending &nbsp;&bull;&nbsp; &copy; {year} AIRE Technologies</div>", unsafe_allow_html=True)
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -3254,7 +3458,7 @@ def view_dashboard():
     d = st.session_state.deal_data
     
     # Header
-    grade_cls = f"grade-{d['grade'].lower()}"
+    _sl, _sc, _sb = deal_screen(d)
     st.markdown(f"""
     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:24px;">
       <div>
@@ -3262,8 +3466,8 @@ def view_dashboard():
         <div style="font-size:13px; color:#64748b;">{d.get('address','')} &nbsp;•&nbsp; {d['units']} Units &nbsp;•&nbsp; {d['type']} &nbsp;•&nbsp; {d['vintage']} Vintage</div>
       </div>
       <div style="text-align:right;">
-        <span class="grade-badge {grade_cls}">{d['grade']}</span>
-        <div style="font-size:11px; color:#64748b; margin-top:4px;">Deal Score: {d['score']}/100</div>
+        <span style="background:{_sb};color:{_sc};font-weight:800;font-size:13px;padding:6px 16px;border-radius:999px;">{_sl}</span>
+        <div style="font-size:11px; color:#64748b; margin-top:6px;">Screen vs firm policy</div>
       </div>
     </div>
     """, unsafe_allow_html=True)
@@ -3304,6 +3508,9 @@ def view_dashboard():
     # Row 2.4 – AIRE Risk Grade (explainable multi-factor model)
     render_grade_panel(d, st.session_state.settings, mc)
 
+    # The Firm Ledger — decision capture (pursue / pass / revisit + reason)
+    render_decision_panel(d)
+
     # Row 2.42 – Market regime + market-implied valuation (reprices live)
     render_market_panel(d)
 
@@ -3314,7 +3521,7 @@ def view_dashboard():
     _g = aire_grade_deal(d, st.session_state.settings, mc)
     _blocks = [
         {"kpis": [("Purchase Price", f"${d['purchase_price']/1e6:.1f}M"),
-                  ("Grade", f"{_g['grade']} ({_g['score']}/100)"),
+                  ("Screen", screen_label(_g['n_flags'], _g['n_watch'])[0]),
                   ("Levered IRR", f"{_g['irr']:.1%}"),
                   ("DSCR", f"{_g['dscr']:.2f}x")]},
         {"heading": "Risk Grade — Factor Breakdown"},
@@ -3344,8 +3551,8 @@ def view_dashboard():
                _blocks, f"AIRE_{d['name'][:20].replace(' ','_')}.pdf", "pdf_dash")
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # Row 2.5 – AIRE Comps Network benchmark
-    render_comps_panel(d, st.session_state.settings)
+    # (Comps Network paused — returns in Stage 3 as lagged, aggregated
+    #  benchmarks designed with antitrust counsel. Strategy doc §21, §23.5)
 
     # Row 3 – Pro Forma | Capital Stack
     pf = build_proforma(d['noi_year1'], st.session_state.settings['rent_growth'],
@@ -3456,7 +3663,7 @@ def view_pipeline():
         for i, p in enumerate(props):
             status_cls = {"active":"status-active","closed":"status-closed","watch":"status-watch"}.get(p['status'],"status-active")
             ai_icon = "✅" if p.get('ai_correct') else "🔄"
-            grade_cls = f"grade-{p['grade'].lower()}"
+            _pl, _pc, _pb = deal_screen(p)
             prop_name = p['name']
             prop_addr = p.get('address','')
             prop_units = p['units']
@@ -3472,7 +3679,7 @@ def view_pipeline():
               <div style="color:#334155; padding-top:4px;">{prop_units}</div>
               <div style="font-family:'JetBrains Mono'; color:#1d4ed8; font-weight:700; padding-top:4px;">{prop_irr}</div>
               <div style="font-family:'JetBrains Mono'; padding-top:4px;">{prop_em}</div>
-              <div style="padding-top:4px;"><span class="grade-badge {grade_cls}" style="font-size:13px; padding:2px 10px;">{p['grade']}</span></div>
+              <div style="padding-top:4px;"><span style="background:{_pb};color:{_pc};font-weight:800;font-size:12px;padding:3px 12px;border-radius:999px;">{_pl}</span></div>
               <div style="padding-top:4px;"><span class="status-pill {status_cls}">{p['status'].upper()}</span></div>
               <div style="padding-top:4px; font-size:12px;">{ai_icon} {ai_label}</div>
             </div>
@@ -3520,6 +3727,10 @@ def view_pipeline():
         purchase_price = c7.number_input("Purchase Price ($)", min_value=0, value=10000000, step=100000)
         noi_y1         = c8.number_input("NOI Year 1 ($)", min_value=0, value=500000, step=10000)
         ltv            = c9.slider("LTV (%)", 40, 80, 65) / 100
+        cB1, cB2, cB3 = st.columns(3)
+        broker_name    = cB1.text_input("Broker (optional)", placeholder="Jane Smith")
+        broker_shop    = cB2.text_input("Brokerage (optional)", placeholder="CBRE / JLL / Marcus & Millichap")
+        guidance_price = cB3.number_input("Guidance / Whisper ($, optional)", min_value=0, value=0, step=100000)
         submitted = st.form_submit_button("Add Deal to Pipeline", type="primary", use_container_width=True)
         if submitted and deal_name:
             debt  = purchase_price * ltv
@@ -3544,8 +3755,13 @@ def view_pipeline():
                 "lp_equity": lp_eq, "gp_equity": gp_eq, "noi_year1": noi_y1,
                 "irr": est_irr, "equity_mult": est_em, "gp_irr": est_irr * 1.4,
                 "loss_prob": est_loss, "grade": g, "score": s,
+                "n_flags": _gr["n_flags"], "n_watch": _gr["n_watch"],
                 "acquisition_date": datetime.now().strftime("%Y-%m-%d"),
                 "ai_prediction": est_irr, "ai_correct": True,
+                "broker_name": broker_name or "", "broker_shop": broker_shop or "",
+                "guidance_price": float(guidance_price or 0),
+                "decision": "", "decision_reason": "", "decision_note": "",
+                "revisit_price": 0.0, "decided_at": "",
                 "lat": 0.0, "lon": 0.0, "notes": ""
             }
             # Save to DB FIRST — before touching session state
@@ -3561,7 +3777,7 @@ def view_pipeline():
             st.session_state.last_save_err = err
             st.session_state.last_save_name = deal_name
             audit_log("deal_created", deal_name,
-                      f"Added to pipeline — ${purchase_price/1e6:.1f}M {deal_type}, {int(deal_units)} units, Grade {g}")
+                      f"Added to pipeline — ${purchase_price/1e6:.1f}M {deal_type}, {int(deal_units)} units — screen: {screen_label(_gr['n_flags'], _gr['n_watch'])[0]}")
             st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -3616,10 +3832,12 @@ def view_data_room():
                             "loss_prob":   _gr["loss_prob"],
                             "score":       _gr["score"],
                             "grade":       _gr["grade"],
+                            "n_flags":     _gr["n_flags"],
+                            "n_watch":     _gr["n_watch"],
                         })
                         db_save(st.session_state.deal_data, st.session_state.user_email)
                         audit_log("deal_updated", st.session_state.deal_data["name"],
-                                  f"T12 imported — NOI ${t12_parsed['noi']:,.0f}, re-underwritten to Grade {_gr['grade']} ({_gr['score']}/100)")
+                                  f"T12 imported — NOI ${t12_parsed['noi']:,.0f}, re-screened: {screen_label(_gr['n_flags'], _gr['n_watch'])[0]}")
 
                 st.success("Documents indexed and analyzed ✓")
                 c1, c2 = st.columns(2)
@@ -3690,7 +3908,7 @@ def view_ai_tracker():
         status_color = {"active":"#1d4ed8","watch":"#d97706","closed":"#16a34a"}.get(p['status'],"#64748b")
         card_cls = "tracker-card " + ("tracker-correct" if p.get('ai_correct') else "tracker-watch")
         
-        with st.expander(f"{'✅' if p.get('ai_correct') else '🔄'}  {p['name']} — Grade {p['grade']}  |  IRR {p['irr']:.1%}  |  Score {p['score']}/100"):
+        with st.expander(f"{'✅' if p.get('ai_correct') else '🔄'}  {p['name']} — {deal_screen(p)[0]}  |  IRR {p['irr']:.1%}"):
             col_info, col_ai = st.columns([1, 1.5])
             
             with col_info:
@@ -3841,7 +4059,7 @@ Write 2 concise paragraphs. Professional tone. Include specific metrics."""
               <div><span style="font-size:11px; color:#64748b; font-weight:700;">ASSET</span><br><b>{d['name']}</b></div>
               <div><span style="font-size:11px; color:#64748b; font-weight:700;">TYPE / UNITS</span><br><b>{d['type']} / {d['units']} Units</b></div>
               <div><span style="font-size:11px; color:#64748b; font-weight:700;">PURCHASE PRICE</span><br><b>${d['purchase_price']/1e6:.1f}M</b></div>
-              <div><span style="font-size:11px; color:#64748b; font-weight:700;">DEAL GRADE</span><br><b>{d['grade']} — {d['score']}/100</b></div>
+              <div><span style="font-size:11px; color:#64748b; font-weight:700;">SCREEN</span><br><b>{deal_screen(d)[0]} vs firm policy</b></div>
             </div>
           </div>
           
@@ -3894,16 +4112,8 @@ def view_settings():
     else:
         st.info("Onboarding mode OFF — platform runs in standard mode.", icon="✅")
 
-    # ── AIRE Comps Network opt-in ──
-    st.markdown("<br>", unsafe_allow_html=True)
-    _optin = st.toggle("Contribute anonymized comps to the AIRE Comps Network",
-        value=st.session_state.settings.get("comps_optin", True),
-        help="Shares banded, fully anonymized deal metrics (entry cap, IRR, assumptions) with the network benchmark. No names, addresses, prices, or firm identities are ever stored. Powers the live benchmarks on your Deal Dashboard.")
-    st.session_state.settings["comps_optin"] = _optin
-    if _optin:
-        st.caption("Your firm benchmarks against the full network and contributes anonymized data points.")
-    else:
-        st.caption("Contribution paused — you can still view network benchmarks built from participating firms.")
+    # Comps Network paused — Stage 3 product, redesigned with antitrust counsel.
+    # No cross-firm data leaves this tenant.
 
     st.markdown("<br>", unsafe_allow_html=True)
     st.markdown("<div style='font-size:18px;font-weight:800;color:#e8f0fa;margin-bottom:20px;'>Underwriting Assumptions</div>", unsafe_allow_html=True)
@@ -3971,7 +4181,7 @@ def view_property_detail():
         st.session_state.current_view = "Pipeline"
         st.rerun()
 
-    grade_cls = f"grade-{d['grade'].lower()}"
+    _sl, _sc, _sb = deal_screen(d)
     pf   = build_proforma(d["noi_year1"], st.session_state.settings["rent_growth"],
                           st.session_state.settings["expense_growth"],
                           d["purchase_price"], d["debt_amount"],
@@ -3985,7 +4195,7 @@ def view_property_detail():
         <div style="font-size:26px;font-weight:900;color:#0f172a;">{d["name"]}</div>
         <div style="font-size:13px;color:#64748b;">{d.get("address","")} &bull; {d["units"]} Units &bull; {d["type"]} &bull; {d["vintage"]}</div>
       </div>
-      <span class="grade-badge {grade_cls}" style="font-size:28px;">{d["grade"]}</span>
+      <span style="background:{_sb};color:{_sc};font-weight:900;font-size:16px;padding:8px 20px;border-radius:999px;">{_sl}</span>
     </div>
     """, unsafe_allow_html=True)
 
@@ -4088,7 +4298,7 @@ def generate_pdf_memo(d: dict, memo_text: str, rec: str) -> bytes:
       <div><div class="lbl">Asset</div><div class="val">{d["name"]}</div></div>
       <div><div class="lbl">Type / Units</div><div class="val">{d["type"]} / {d["units"]} Units</div></div>
       <div><div class="lbl">Purchase Price</div><div class="val">${d["purchase_price"]/1e6:.1f}M</div></div>
-      <div><div class="lbl">Deal Grade</div><div class="val">{d["grade"]} &mdash; {d["score"]}/100</div></div>
+      <div><div class="lbl">Screen</div><div class="val">{deal_screen(d)[0]}</div></div>
       <div><div class="lbl">Address</div><div class="val">{d.get("address","&mdash;")}</div></div>
       <div><div class="lbl">Acquisition Date</div><div class="val">{d.get("acquisition_date","&mdash;")}</div></div>
     </div>
@@ -4398,7 +4608,6 @@ def view_deal_comparison():
     # Header cards
     hc1, hc2 = st.columns(2)
     for col, d, color in [(hc1, d1, "#2563eb"), (hc2, d2, "#16a34a")]:
-        grade_cls = f"grade-{d['grade'].lower()}"
         with col:
             st.markdown(f"""
             <div style="background:#fff;border-radius:10px;border:2px solid {color};padding:16px;margin-bottom:16px;">
@@ -4417,8 +4626,7 @@ def view_deal_comparison():
         ("Equity Multiple",  f"{d1['equity_mult']:.2f}x",                 f"{d2['equity_mult']:.2f}x",           "higher"),
         ("GP IRR",           f"{d1['gp_irr']:.1%}",                       f"{d2['gp_irr']:.1%}",                 "higher"),
         ("Loss Probability", f"{d1['loss_prob']:.1%}",                    f"{d2['loss_prob']:.1%}",              "lower"),
-        ("Deal Score",       f"{d1['score']}/100",                         f"{d2['score']}/100",                  "higher"),
-        ("Grade",            d1["grade"],                                   d2["grade"],                           None),
+        ("Screen",           deal_screen(d1)[0],                            deal_screen(d2)[0],                    None),
         ("Status",           d1["status"].upper(),                         d2["status"].upper(),                  None),
     ]
 
@@ -4717,13 +4925,14 @@ def view_om_import():
                             "lp_equity": lp_eq, "gp_equity": gp_eq, "noi_year1": noi,
                             "irr": est_irr, "equity_mult": est_em, "gp_irr": est_irr * 1.4,
                             "loss_prob": est_loss, "grade": g, "score": s,
+                "n_flags": _gr["n_flags"], "n_watch": _gr["n_watch"],
                             "acquisition_date": datetime.now().strftime("%Y-%m-%d"),
                             "ai_prediction": est_irr, "ai_correct": True,
                             "lat": 0.0, "lon": 0.0, "notes": f"Imported from OM. Cap rate: {cap:.2f}%"
                         }
                         ok, err = db_save(new_prop, st.session_state.user_email)
                         audit_log("om_imported", name,
-                                  f"Imported from OM — ${price/1e6:.1f}M {ptype}, {int(units)} units, Grade {g}")
+                                  f"Imported from OM — ${price/1e6:.1f}M {ptype}, {int(units)} units — screen: {screen_label(_gr['n_flags'], _gr['n_watch'])[0]}")
                         st.session_state.properties.append(new_prop)
                         st.session_state.deal_data   = new_prop
                         st.session_state.deal_loaded = True
@@ -4799,7 +5008,7 @@ def view_lp_portal():
               <div style="font-size:12px;color:#64748b;margin-top:2px;">{p.get("address","") or "—"} &bull; {p["type"]} &bull; {p["units"]} Units &bull; {p["vintage"]}</div>
               <div style="font-size:11px;color:#94a3b8;margin-top:2px;">Acquired {p.get("acquisition_date","—")}</div>
             </div>
-            <span style="background:{grade_bg};color:{grade_color};font-size:13px;font-weight:800;padding:6px 14px;border-radius:6px;">Grade {p["grade"]}</span>
+            <span style="background:{deal_screen(p)[2]};color:{deal_screen(p)[1]};font-size:13px;font-weight:800;padding:6px 14px;border-radius:999px;">{deal_screen(p)[0]}</span>
           </div>
           <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:12px;">
             <div style="text-align:center;background:#f8fafc;border-radius:8px;padding:10px;">
@@ -4966,7 +5175,7 @@ def view_crm():
             <div style="font-size:11px;color:#64748b;">Price<br><b style="color:#0f172a;">${p["purchase_price"]/1e6:.1f}M</b></div>
             <div style="font-size:11px;color:#64748b;">IRR<br><b style="color:#1d4ed8;">{p["irr"]:.1%}</b></div>
             <div style="font-size:11px;color:#64748b;">Cap Rate<br><b style="color:#0f172a;">{cap_rate:.2%}</b></div>
-            <div style="font-size:11px;color:#64748b;">Grade<br><b style="color:#0f172a;">{p["grade"]}</b></div>
+            <div style="font-size:11px;color:#64748b;">Screen<br><b style="color:#0f172a;">{deal_screen(p)[0]}</b></div>
           </div>
           {f'<div style="margin-top:10px;font-size:12px;color:#64748b;">🏢 Broker: <b>{crm["broker"]}</b></div>' if crm.get("broker") else ""}
           {f'<div style="font-size:11px;color:#94a3b8;margin-top:4px;">Last updated: {crm["history"][-1]["date"] if crm["history"] else "—"}</div>'}
@@ -5384,7 +5593,7 @@ def view_memo_delivery():
 Property: {d["name"]}, {d["units"]} units, {d["type"]}
 IRR: {d["irr"]:.1%}, EM: {d["equity_mult"]:.2f}x, GP IRR: {d["gp_irr"]:.1%}
 NOI Y1: ${d["noi_year1"]:,.0f}, Purchase Price: ${d["purchase_price"]:,.0f}
-Deal Grade: {d["grade"]} ({d["score"]}/100)
+Screen: {deal_screen(d)[0]} vs firm policy
 Recommendation: {rec}
 Write 2 concise professional paragraphs. Use specific metrics. No fluff."""
                     try:
@@ -5448,7 +5657,7 @@ Write 2 concise professional paragraphs. Use specific metrics. No fluff."""
                   <div><div style='font-size:9px;color:#64748b;font-weight:700;text-transform:uppercase;'>Asset</div><div style='font-size:13px;font-weight:700;'>{d["name"]}</div></div>
                   <div><div style='font-size:9px;color:#64748b;font-weight:700;text-transform:uppercase;'>Type / Units</div><div style='font-size:13px;font-weight:700;'>{d["type"]} / {d["units"]}</div></div>
                   <div><div style='font-size:9px;color:#64748b;font-weight:700;text-transform:uppercase;'>Purchase Price</div><div style='font-size:13px;font-weight:700;'>${d["purchase_price"]/1e6:.1f}M</div></div>
-                  <div><div style='font-size:9px;color:#64748b;font-weight:700;text-transform:uppercase;'>Grade</div><div style='font-size:13px;font-weight:700;'>{d["grade"]} — {d["score"]}/100</div></div>
+                  <div><div style='font-size:9px;color:#64748b;font-weight:700;text-transform:uppercase;'>Screen</div><div style='font-size:13px;font-weight:700;'>{deal_screen(d)[0]}</div></div>
                 </div>
                 <div style='font-size:10px;font-weight:700;color:#64748b;text-transform:uppercase;margin-bottom:6px;'>Executive Summary</div>
                 <div style='font-size:12px;line-height:1.7;color:#334155;margin-bottom:16px;'>{memo_text if memo_text else "<em style='color:#94a3b8;'>Click Generate AI Memo to populate...</em>"}</div>
@@ -6294,7 +6503,7 @@ DEALS:
         dscr = p['noi_year1']/ds if ds > 0 else 0
         ltv  = debt/p['purchase_price'] if p['purchase_price'] else 0
         portfolio_summary += f"""
-• {p['name']} | {p['type']} | {p['units']} units | Grade {p['grade']}
+• {p['name']} | {p['type']} | {p['units']} units | Screen: {deal_screen(p)[0]}
   Price: ${p['purchase_price']/1e6:.1f}M | NOI: ${p['noi_year1']:,.0f} | Cap: {cap:.2%}
   IRR: {p['irr']:.1%} | EM: {p['equity_mult']:.2f}x | DSCR: {dscr:.2f}x | LTV: {ltv:.0%}
   Status: {p.get('status','active')}
@@ -6375,7 +6584,7 @@ Equity Multiple: {deal['equity_mult']:.2f}x
 DSCR: {dscr:.2f}x
 LTV: {ltv:.0%}
 Loss Probability: {deal.get('loss_prob',0.05):.1%}
-Deal Grade: {deal['grade']} ({deal.get('score',50)}/100)
+Screen: {deal_screen(deal)[0]} vs firm policy
 
 FIRM TARGETS:
 Target IRR: {settings.get('target_irr',0.15):.1%}
@@ -6985,16 +7194,15 @@ def view_scenarios():
     cols = st.columns(len(results))
     for col, r in zip(cols, results):
         g, mc = r["g"], r["mc"]
-        gc, gbg, _ = GRADE_STYLES.get(g["grade"], GRADE_STYLES["C"])
+        gl, gc, gbg = screen_label(g["n_flags"], g["n_watch"])
         with col:
             st.markdown(
                 "<div style='background:#fff;border:1px solid #e4ecf7;border-top:3px solid "
                 f"{gc};border-radius:14px;padding:18px 16px;box-shadow:0 1px 6px rgba(7,17,31,0.06);'>"
                 f"<div style='font-family:Outfit,sans-serif;font-size:15px;font-weight:800;color:#07111f;margin-bottom:12px;'>{r['name']}</div>"
                 f"<div style='display:flex;align-items:center;gap:10px;margin-bottom:14px;'>"
-                f"<span style='background:{gbg};color:{gc};font-family:Outfit,sans-serif;font-size:1.6rem;"
-                f"font-weight:900;padding:4px 14px;border-radius:10px;'>{g['grade']}</span>"
-                f"<span style='font-family:JetBrains Mono,monospace;font-size:13px;color:{gc};font-weight:700;'>{g['score']}/100</span>"
+                f"<span style='background:{gbg};color:{gc};font-family:Outfit,sans-serif;font-size:1.05rem;"
+                f"font-weight:900;padding:6px 16px;border-radius:999px;'>{gl}</span>"
                 "</div>"
                 + "".join(
                     f"<div style='display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid #f1f5f9;'>"
@@ -7018,7 +7226,7 @@ def view_scenarios():
         st.markdown("<div class='panel-title'>Impact vs Base Case</div>", unsafe_allow_html=True)
         for r in results[1:]:
             d_irr = r["mc"]["p50"] - b["mc"]["p50"]
-            d_sc  = r["g"]["score"] - b["g"]["score"]
+            d_fl  = r["g"]["n_flags"] - b["g"]["n_flags"]
             col = "#059669" if d_irr >= 0 else "#dc2626"
             st.markdown(
                 f"<div style='display:flex;gap:22px;align-items:center;padding:9px 0;border-bottom:1px solid #f1f5f9;'>"
@@ -7026,7 +7234,7 @@ def view_scenarios():
                 f"<span style='font-family:JetBrains Mono,monospace;font-size:13px;font-weight:700;color:{col};'>"
                 f"{d_irr*100:+.1f} pts IRR</span>"
                 f"<span style='font-family:JetBrains Mono,monospace;font-size:13px;font-weight:700;color:{col};'>"
-                f"{d_sc:+d} grade pts</span>"
+                f"{d_fl:+d} flags</span>"
                 f"<span style='font-size:12px;color:#6f8aab;'>P5 falls to {r['mc']['p5']:.1%}</span>"
                 "</div>", unsafe_allow_html=True)
 
@@ -7034,8 +7242,8 @@ def view_scenarios():
     st.markdown("<br>", unsafe_allow_html=True)
     blocks = [
         {"heading": "Scenario Results"},
-        {"table": {"head": ["Scenario","Grade","Score","IRR P50","IRR P5","IRR P95","EM","DSCR","Loss"],
-                   "rows": [[r["name"], r["g"]["grade"], f"{r['g']['score']}/100",
+        {"table": {"head": ["Scenario","Screen","IRR P50","IRR P5","IRR P95","EM","DSCR","Loss"],
+                   "rows": [[r["name"], screen_label(r["g"]["n_flags"], r["g"]["n_watch"])[0],
                              f"{r['mc']['p50']:.1%}", f"{r['mc']['p5']:.1%}", f"{r['mc']['p95']:.1%}",
                              f"{r['g']['em']:.2f}x", f"{r['dscr']:.2f}x", f"{r['mc']['loss_prob']:.0%}"]
                             for r in results]}},
@@ -7182,7 +7390,6 @@ NAV_SECTIONS = [
         "items": [
             ("IC Memo Generator","ICMemo"),
             ("Memo Delivery",    "MemoDelivery"),
-            ("Broker Emails",    "BrokerEmails"),
         ],
     },
     {
@@ -7207,7 +7414,6 @@ NAV_SECTIONS = [
             ("Portfolio Monte Carlo", "PortfolioMC"),
             ("Portfolio Alerts", "Alerts"),
             ("Deal CRM",         "CRM"),
-            ("LP Portal",        "LPPortal"),
             ("OM Import",        "OMImport"),
         ],
     },
@@ -7217,8 +7423,6 @@ NAV_SECTIONS = [
         "bg":    "rgba(100,116,139,0.10)",
         "items": [
             ("Team",             "Team"),
-            ("White-Label",      "WhiteLabel"),
-            ("Lender Database",  "LenderDB"),
             ("Audit Trail",      "AuditTrail"),
             ("Model Verification","ModelVerify"),
             ("Settings",         "Settings"),
@@ -7419,7 +7623,6 @@ def main():
     elif v == "Compare":        view_deal_comparison()
     elif v == "Alerts":         view_alerts()
     elif v == "OMImport":       view_om_import()
-    elif v == "LPPortal":       view_lp_portal()
     elif v == "CRM":            view_crm()
     elif v == "MarketData":     view_market_data()
     elif v == "AIScorer":       view_ai_scorer()
@@ -7427,11 +7630,8 @@ def main():
     elif v == "StressTest":     view_stress_test()
     elif v == "VersionPF":      view_version_proforma()
     elif v == "Team":           view_team()
-    elif v == "WhiteLabel":     view_whitelabel()
-    elif v == "LenderDB":       view_lender_db()
     elif v == "AuditTrail":     view_audit_trail()
     elif v == "ModelVerify":    view_model_verification()
-    elif v == "BrokerEmails":   view_broker_emails()
     elif v == "Intelligence":    view_aire_intelligence()
     elif v == "Scenarios":       view_scenarios()
     elif v == "PortfolioMC":     view_portfolio_mc()
