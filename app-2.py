@@ -546,6 +546,23 @@ def inject_css():
         background: #f5f8fd !important; border: 1px solid #e4ecf7 !important;
         border-radius: 6px !important; color: #0d1f3c !important;
       }
+      .stMarkdown table {
+        border-collapse: collapse !important; width: 100% !important;
+        font-size: 12.5px !important; margin: 12px 0 !important;
+        border-radius: 10px !important; overflow: hidden !important;
+      }
+      .stMarkdown th {
+        background: #f5f8fd !important; color: #3a5278 !important;
+        font-size: 10px !important; font-weight: 700 !important;
+        text-transform: uppercase !important; letter-spacing: 0.07em !important;
+        padding: 9px 14px !important; border: 1px solid #e4ecf7 !important;
+        text-align: left !important;
+      }
+      .stMarkdown td {
+        padding: 8px 14px !important; border: 1px solid #eef3fa !important;
+        color: #1e293b !important; font-size: 12.5px !important;
+      }
+      .stMarkdown tr:nth-child(even) td { background: #fafcff !important; }
 
       /* ── LINK BUTTONS ── */
       a[data-testid="stLinkButton"] {
@@ -2282,7 +2299,7 @@ def render_grade_panel(deal: dict, settings: dict, mc: dict = None):
 
 def ai_analyze_deal(deal_context: str, chat_history: list, user_msg: str) -> str:
     """Claude-powered deal analysis — institutional CRE intelligence."""
-    system = f"""You are AIRE Intelligence, an elite institutional CRE underwriting AI.
+    system = f"""You are AIRE Intelligence, an elite institutional CRE underwriting AI.\n\nFORMAT (strict): Respond in clean markdown. Use ### Title Case headers for sections (never ALL-CAPS headers, never single-#), short paragraphs, **bold** for key numbers, markdown tables for any numeric comparison, and - bullets for lists. No preamble before the first header.
 You combine the analytical rigor of top-tier PE firms (Blackstone, KKR, Starwood) with cutting-edge AI.
 You are precise, quantitative, and direct. Always cite specific numbers from the deal context.
 You identify risks honestly, benchmark against market data, and give actionable recommendations.
@@ -3783,7 +3800,7 @@ Write 2 concise paragraphs. Professional tone. Include specific metrics."""
             st.markdown("<br>", unsafe_allow_html=True)
             pdf_bytes = generate_pdf_memo(
                 st.session_state.deal_data,
-                st.session_state.get('ic_memo_text',''),
+                st.session_state.get('ic_memo_text','').replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"),
                 st.session_state.get('ic_memo_rec','APPROVE')
             )
             ext  = "pdf" if pdf_bytes[:4] == b"%PDF" else "html"
@@ -6229,7 +6246,8 @@ Keep it concise and action-oriented. No fluff."""
                         from_addr = st.secrets.get("SENDGRID_FROM_EMAIL","noreply@aire.io")
                         if sg_key:
                             try:
-                                html_body = f"<pre style='font-family:Arial;font-size:13px;white-space:pre-wrap;'>{edited}</pre>"
+                                _esc = edited.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+                                html_body = f"<pre style='font-family:Arial;font-size:13px;white-space:pre-wrap;'>{_esc}</pre>"
                                 resp = requests.post("https://api.sendgrid.com/v3/mail/send",
                                     headers={"Authorization":f"Bearer {sg_key}","Content-Type":"application/json"},
                                     json={"personalizations":[{"to":[{"email":send_to}]}],
@@ -6288,7 +6306,7 @@ DEALS:
     except Exception:
         pass
 
-    system = """You are AIRE Intelligence, the most advanced institutional CRE analysis AI ever built.
+    system = """You are AIRE Intelligence, the most advanced institutional CRE analysis AI ever built.\n\nFORMAT (strict): Respond in clean markdown. Use ### Title Case headers for sections (never ALL-CAPS headers, never single-#), short paragraphs, **bold** for key numbers, markdown tables for any numeric comparison, and - bullets for lists. No preamble before the first header.
 You operate at the level of a Managing Director at a top-5 private equity real estate firm.
 You have deep expertise in: portfolio construction, risk management, capital markets, debt structuring,
 market cycles, LP/GP dynamics, value-add strategies, and institutional underwriting.
@@ -6337,7 +6355,7 @@ def run_claude_deal_score(deal: dict, settings: dict, market_data: dict = None) 
     dscr = deal['noi_year1']/ds if ds > 0 else 0
     ltv  = debt/deal['purchase_price'] if deal['purchase_price'] else 0
 
-    system = """You are AIRE Intelligence, the world's most advanced institutional CRE underwriting AI.
+    system = """You are AIRE Intelligence, the world's most advanced institutional CRE underwriting AI.\n\nFORMAT (strict): Respond in clean markdown. Use ### Title Case headers for sections (never ALL-CAPS headers, never single-#), short paragraphs, **bold** for key numbers, markdown tables for any numeric comparison, and - bullets for lists. No preamble before the first header.
 You analyze deals with the depth of a 20-year PE veteran and the speed of AI.
 Give a complete, honest, institutional-grade deal analysis. Be specific. Use real numbers.
 Do not hedge excessively. Give a clear verdict."""
@@ -6469,25 +6487,12 @@ def view_aire_intelligence():
                     analysis = st.session_state.portfolio_intel_cache
 
                 # Render analysis in premium card
-                st.markdown(f"""
-                <div style="background:#fff;border:1px solid #e4ecf7;border-radius:14px;
-                            padding:28px 32px;margin-top:20px;box-shadow:0 2px 16px rgba(7,17,31,0.06);">
-                  <div style="display:flex;justify-content:space-between;align-items:center;
-                              margin-bottom:20px;padding-bottom:14px;border-bottom:1px solid #f1f5f9;">
-                    <div>
-                      <div style="font-size:11px;color:#7c3aed;font-weight:700;text-transform:uppercase;
-                                  letter-spacing:1px;margin-bottom:3px;">PORTFOLIO ANALYSIS</div>
-                      <div style="font-size:14px;font-weight:800;color:#07111f;">AIRE Intelligence Report</div>
-                    </div>
-                    <div style="font-size:11px;color:#94a3b8;">{datetime.now().strftime("%B %d, %Y %H:%M")}</div>
-                  </div>
-                  <div style="font-size:13.5px;color:#1e293b;line-height:1.85;white-space:pre-wrap;">{analysis}</div>
-                  <div style="margin-top:20px;padding-top:14px;border-top:1px solid #f1f5f9;
-                              font-size:10px;color:#94a3b8;">
-                    Generated by AIRE Intelligence · Institutional Underwriting Engine · Patent Pending
-                  </div>
-                </div>
-                """, unsafe_allow_html=True)
+                with st.container(border=True):
+                    st.markdown("<div style='display:flex;justify-content:space-between;align-items:center;padding-bottom:10px;border-bottom:1px solid #f1f5f9;margin-bottom:4px;'><span style='font-size:11px;color:{c};font-weight:700;text-transform:uppercase;letter-spacing:1px;'>{label}</span><span style='font-size:11px;color:#94a3b8;'>{when}</span></div>".format(c="#7c3aed",
+                        label="Portfolio Analysis — AIRE Intelligence Report",
+                        when=datetime.now().strftime("%B %d, %Y %H:%M")), unsafe_allow_html=True)
+                    st.markdown(analysis)   # native markdown — headers, tables, bold all render
+                    st.markdown("<div style='padding-top:10px;border-top:1px solid #f1f5f9;font-size:10px;color:#94a3b8;'>Generated by AIRE Intelligence · Institutional Underwriting Engine · Patent Pending</div>", unsafe_allow_html=True)
 
     # ── TAB 2: Deal Deep Dive ──
     with tab2:
@@ -6519,25 +6524,12 @@ def view_aire_intelligence():
                 else:
                     analysis = st.session_state[cache_key]
 
-                st.markdown(f"""
-                <div style="background:#fff;border:1px solid #e4ecf7;border-radius:14px;
-                            padding:28px 32px;margin-top:20px;box-shadow:0 2px 16px rgba(7,17,31,0.06);">
-                  <div style="display:flex;justify-content:space-between;align-items:center;
-                              margin-bottom:20px;padding-bottom:14px;border-bottom:1px solid #f1f5f9;">
-                    <div>
-                      <div style="font-size:11px;color:#1a6fe0;font-weight:700;text-transform:uppercase;
-                                  letter-spacing:1px;margin-bottom:3px;">DEAL DEEP DIVE</div>
-                      <div style="font-size:14px;font-weight:800;color:#07111f;">{sel_name}</div>
-                    </div>
-                    <div style="font-size:11px;color:#94a3b8;">{datetime.now().strftime("%B %d, %Y")}</div>
-                  </div>
-                  <div style="font-size:13.5px;color:#1e293b;line-height:1.85;white-space:pre-wrap;">{analysis}</div>
-                  <div style="margin-top:20px;padding-top:14px;border-top:1px solid #f1f5f9;
-                              font-size:10px;color:#94a3b8;">
-                    Generated by AIRE Intelligence · Institutional Underwriting Engine · Patent Pending
-                  </div>
-                </div>
-                """, unsafe_allow_html=True)
+                with st.container(border=True):
+                    st.markdown("<div style='display:flex;justify-content:space-between;align-items:center;padding-bottom:10px;border-bottom:1px solid #f1f5f9;margin-bottom:4px;'><span style='font-size:11px;color:{c};font-weight:700;text-transform:uppercase;letter-spacing:1px;'>{label}</span><span style='font-size:11px;color:#94a3b8;'>{when}</span></div>".format(c="#1a6fe0",
+                        label=f"Deal Deep Dive — {sel_name}",
+                        when=datetime.now().strftime("%B %d, %Y")), unsafe_allow_html=True)
+                    st.markdown(analysis)
+                    st.markdown("<div style='padding-top:10px;border-top:1px solid #f1f5f9;font-size:10px;color:#94a3b8;'>Generated by AIRE Intelligence · Institutional Underwriting Engine · Patent Pending</div>", unsafe_allow_html=True)
 
     # ── TAB 3: Ask AIRE ──
     with tab3:
@@ -6573,19 +6565,14 @@ def view_aire_intelligence():
                 st.markdown(f"""
                 <div style="background:#f0f4f8;border-radius:10px;padding:12px 16px;
                             margin-bottom:8px;max-width:85%;margin-left:auto;">
-                  <div style="font-size:13px;color:#07111f;">{msg["content"]}</div>
+                  <div style="font-size:13px;color:#07111f;">{msg["content"].replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")}</div>
                 </div>""", unsafe_allow_html=True)
             else:
-                st.markdown(f"""
-                <div style="background:#fff;border:1px solid #e4ecf7;border-radius:10px;
-                            padding:16px 20px;margin-bottom:12px;
-                            border-left:4px solid #7c3aed;">
-                  <div style="font-size:10px;color:#7c3aed;font-weight:700;
-                              text-transform:uppercase;letter-spacing:0.8px;margin-bottom:8px;">
-                    AIRE Intelligence
-                  </div>
-                  <div style="font-size:13.5px;color:#1e293b;line-height:1.8;white-space:pre-wrap;">{msg["content"]}</div>
-                </div>""", unsafe_allow_html=True)
+                with st.container(border=True):
+                    st.markdown("<div style='font-size:10px;color:#7c3aed;font-weight:700;"
+                                "text-transform:uppercase;letter-spacing:0.8px;'>AIRE Intelligence</div>",
+                                unsafe_allow_html=True)
+                    st.markdown(msg["content"])
 
         # Input
         user_q = st.text_input("Ask AIRE Intelligence anything...", key="intel_input",
