@@ -620,11 +620,23 @@ def init_claude():
 
 claude_client = init_claude()
 
+def _claude_create(**kwargs):
+    """Version-tolerant Claude call. The anthropic SDK removed `temperature`
+    from Messages.create() in 1.0 — this filters kwargs against the INSTALLED
+    SDK's live signature so signature drift between majors can never crash us."""
+    import inspect as _insp
+    try:
+        allowed = set(_insp.signature(claude_client.messages.create).parameters)
+        kwargs = {k: v for k, v in kwargs.items() if k in allowed}
+    except (ValueError, TypeError):
+        pass  # exotic signature (e.g. **kwargs) — send as-is
+    return claude_client.messages.create(**kwargs)
+
 def call_claude(system: str, user: str, max_tokens: int = 1024, temperature: float = 0.3) -> str:
     """Call Claude claude-sonnet-4-5. Falls back to GPT-4o if Claude unavailable."""
     if claude_client:
         try:
-            msg = claude_client.messages.create(
+            msg = _claude_create(
                 model="claude-sonnet-4-5",
                 max_tokens=max_tokens,
                 temperature=temperature,
@@ -2286,7 +2298,7 @@ End every response with a one-line "AIRE Score:" summary."""
 
     try:
         if claude_client:
-            msg = claude_client.messages.create(
+            msg = _claude_create(
                 model="claude-sonnet-4-5",
                 max_tokens=700,
                 temperature=0.3,
@@ -6298,7 +6310,7 @@ You are the competitive edge that separates AIRE from every other CRE tool on th
 
     try:
         if claude_client:
-            msg = claude_client.messages.create(
+            msg = _claude_create(
                 model="claude-sonnet-4-5",
                 max_tokens=2000,
                 temperature=0.2,
@@ -6362,7 +6374,7 @@ Provide:
 
     try:
         if claude_client:
-            msg = claude_client.messages.create(
+            msg = _claude_create(
                 model="claude-sonnet-4-5",
                 max_tokens=1200,
                 temperature=0.15,
