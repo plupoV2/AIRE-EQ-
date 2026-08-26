@@ -514,6 +514,39 @@ def inject_css():
       }
       html { scroll-behavior: smooth; }
 
+      /* ── Micro-polish — the details premium products get right ── */
+      ::selection { background: #1a6fe0; color: #fff; }
+      :focus-visible { outline: 2px solid rgba(26,111,224,0.45) !important; outline-offset: 2px; }
+      [data-testid="stWidgetLabel"] p {
+        font-size: 11.5px !important; font-weight: 600 !important;
+        color: #3a5278 !important; letter-spacing: 0.01em !important;
+      }
+      [data-testid="stExpander"] summary p {
+        font-size: 13px !important; font-weight: 600 !important; color: #3a5278 !important;
+      }
+      hr, [data-testid="stDivider"] { border-color: #e4ecf7 !important; }
+      [data-baseweb="popover"] {
+        border-radius: 10px !important; overflow: hidden !important;
+        box-shadow: 0 8px 30px rgba(7,17,31,0.14) !important;
+        border: 1px solid #e4ecf7 !important;
+      }
+      [role="option"]:hover { background: #f0f6ff !important; }
+      [data-baseweb="tooltip"] {
+        background: #07111f !important; border-radius: 7px !important;
+        font-size: 11px !important; padding: 6px 10px !important;
+      }
+      [data-testid="stNumberInput"] button {
+        background: #f5f8fd !important; border-left: 1px solid #e4ecf7 !important;
+        color: #6f8aab !important;
+      }
+      [data-testid="stNumberInput"] button:hover { color: #1a6fe0 !important; }
+      .stButton > button:active { transform: translateY(0) scale(0.99) !important; }
+      code, pre {
+        font-family: 'JetBrains Mono', monospace !important;
+        background: #f5f8fd !important; border: 1px solid #e4ecf7 !important;
+        border-radius: 6px !important; color: #0d1f3c !important;
+      }
+
       /* ── LINK BUTTONS ── */
       a[data-testid="stLinkButton"] {
         background: var(--navy) !important;
@@ -2895,7 +2928,12 @@ def render_login():
       header, footer             { display:none !important; }
       /* Make the left branded half fill screen height */
       .login-hero {
-        background: linear-gradient(160deg,#0d1f3c 0%,#1b4fa8 55%,#1a9fd4 100%);
+        background:
+          radial-gradient(ellipse 60% 45% at 50% 34%, rgba(26,159,212,0.22), transparent 70%),
+          linear-gradient(rgba(255,255,255,0.035) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(255,255,255,0.035) 1px, transparent 1px),
+          linear-gradient(160deg,#07111f 0%,#0d1f3c 45%,#1b4fa8 100%);
+        background-size: auto, 44px 44px, 44px 44px, auto;
         min-height: 100vh;
         padding: 60px 48px;
         box-sizing: border-box;
@@ -2932,7 +2970,11 @@ def render_login():
         ])
         st.markdown(f"""
         <div class="login-hero">
-          <img src="{AIRE_LOGO_DARK_URI}" style="height:96px;display:block;margin:0 auto 26px;" />
+          <div style="background:#fff;border-radius:20px;padding:22px 28px;
+                      margin-bottom:28px;box-shadow:0 8px 40px rgba(0,0,0,0.22);
+                      display:inline-block;">
+            <img src="{AIRE_LOGO_URI}" style="height:100px;display:block;" />
+          </div>
           <div style="font-size:13px;color:rgba(255,255,255,0.82);font-weight:600;
                       letter-spacing:3px;text-transform:uppercase;text-align:center;margin-bottom:6px;">
             Integrated Real Estate
@@ -3000,7 +3042,16 @@ def render_login():
                         else:
                             st.error("Please enter your email and password.")
 
-            st.markdown(f"<div style='font-size:11px;color:#94a3b8;margin-top:14px;text-align:center;'>aire.rent &nbsp;&bull;&nbsp; Patent Pending &nbsp;&bull;&nbsp; &copy; {year} AIRE Technologies</div>", unsafe_allow_html=True)
+            st.markdown(
+                "<div style='display:flex;align-items:center;justify-content:center;gap:8px;margin-top:18px;'>"
+                "<svg width='11' height='13' viewBox='0 0 11 13' fill='none'>"
+                "<path d='M5.5 0.5 L10.5 2.5 V6 C10.5 9.5 8.4 11.7 5.5 12.5 C2.6 11.7 0.5 9.5 0.5 6 V2.5 Z' "
+                "stroke='#6f8aab' stroke-width='1' fill='none'/>"
+                "<polyline points='3.4,6.3 5,7.9 7.6,4.9' stroke='#1a6fe0' stroke-width='1.2' "
+                "stroke-linecap='round' stroke-linejoin='round' fill='none'/></svg>"
+                "<span style='font-size:11px;color:#6f8aab;font-weight:500;'>Encrypted in transit and at rest "
+                "&nbsp;\u00b7&nbsp; Access provisioned under contract</span></div>", unsafe_allow_html=True)
+            st.markdown(f"<div style='font-size:11px;color:#94a3b8;margin-top:10px;text-align:center;'>aire.rent &nbsp;&bull;&nbsp; Patent Pending &nbsp;&bull;&nbsp; &copy; {year} AIRE Technologies</div>", unsafe_allow_html=True)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # SECTION 5 │ CHARTS
